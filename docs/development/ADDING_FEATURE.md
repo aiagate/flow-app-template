@@ -15,7 +15,7 @@
 | **4. UseCase** | [`src/app/usecases/teams/create_team.py`](../../src/app/usecases/teams/create_team.py)<br>[`src/app/usecases/teams/get_team.py`](../../src/app/usecases/teams/get_team.py)<br>[`src/app/usecases/teams/update_team.py`](../../src/app/usecases/teams/update_team.py) | [`src/app/application/mediator.py`](../../src/app/application/mediator.py)<br>（`_HANDLER_TYPES` タプル） | [`tests/usecases/teams/test_create_team.py`](../../tests/usecases/teams/test_create_team.py)<br>[`tests/usecases/teams/test_get_team.py`](../../tests/usecases/teams/test_get_team.py)<br>[`tests/usecases/teams/test_update_team.py`](../../tests/usecases/teams/test_update_team.py) |
 | **5. Presentation** | （必要な入口のみ選択）<br>Bot: [`src/app/presentation/bot/cogs/teams_cog.py`](../../src/app/presentation/bot/cogs/teams_cog.py)<br>API: [`src/app/presentation/api/routers/teams.py`](../../src/app/presentation/api/routers/teams.py) | Bot: `src/app/presentation/bot/__main__.py`<br>API: `src/app/presentation/api/__main__.py` | 各プレゼンテーション層テスト<br>（例: `tests/presentation/api/` など） |
 | **6. Migration** | `alembic/versions/<rev>_<desc>.py`<br>（※DBスキーマ変更がある場合のみ） | `alembic/` | 使い捨てDBでの検証コマンド群<br>`uv run alembic check` |
-| **7. 品質検証** | リポジトリ全体 | CI / Pre-commit | `TEST_DATABASE_URL=sqlite+aiosqlite:// uv run --frozen pytest`<br>`uv run --frozen ruff format --check .`<br>`uv run --frozen ruff check .`<br>`uv run --frozen pyright` |
+| **7. 品質検証** | リポジトリ全体 | CI / Pre-commit | `TEST_DATABASE_URL=sqlite+aiosqlite:// uv run --frozen --all-extras pytest`<br>`uv run --frozen ruff format --check .`<br>`uv run --frozen ruff check .`<br>`uv run --frozen --all-extras pyright` |
 
 ## 各要素が存在する理由と設計原則
 
@@ -148,13 +148,13 @@
 2. **データベーステストの実行**:
    テスト環境の接続先制御（SQLite一時ファイル／PostgreSQL独立スキーマ）の詳細は [`tests/README.md`](../../tests/README.md) を参照してください。
    ```bash
-   TEST_DATABASE_URL=sqlite+aiosqlite:// uv run --frozen pytest
+   TEST_DATABASE_URL=sqlite+aiosqlite:// uv run --frozen --all-extras pytest
    ```
 3. **静的解析・フォーマットチェックの実行**:
    ```bash
    uv run --frozen ruff format --check .
    uv run --frozen ruff check .
-   uv run --frozen pyright
+   uv run --frozen --all-extras pyright
    ```
 
 ## 公式ドキュメント・参考資料
