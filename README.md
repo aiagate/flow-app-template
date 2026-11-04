@@ -118,6 +118,12 @@ Clone直後に採用元と開始commitを記録し、必要な上流修正は出
 └── README.md                      # このファイル
 ```
 
+## 実装方式の選択
+
+単純な業務処理、状態遷移を持つモデル、読み取り専用Queryの選び分けは
+[業務に応じた実装の選び方](docs/development/IMPLEMENTATION_CHOICES.md)を参照してください。
+集約・Value Object・汎用Repositoryは、すべての機能への必須条件ではありません。
+
 ## 必要な環境
 
 - Python 3.13 以上
