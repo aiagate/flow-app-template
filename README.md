@@ -323,6 +323,9 @@ Discord のサーバーロール操作とは無関係です。
 
 ## アーキテクチャ
 
+Repositoryの外部事例と、汎用実装・専用Port・Session直接利用の比較は
+[Repository設計の比較](docs/development/REPOSITORY_DESIGN.md)を参照してください。
+
 このテンプレートは以下のレイヤーで構成されています：
 
 ```text
