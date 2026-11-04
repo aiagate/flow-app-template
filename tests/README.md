@@ -50,15 +50,15 @@
 
 ```bash
 # 全テスト実行（SQLite一時ファイル、デフォルト）
-TEST_DATABASE_URL=sqlite+aiosqlite:// uv run --frozen pytest
+TEST_DATABASE_URL=sqlite+aiosqlite:// uv run --frozen --all-extras pytest
 
 # PostgreSQL環境での実行例（テスト用DB）
-TEST_DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/test_db uv run --frozen pytest
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/test_db uv run --frozen --all-extras pytest
 
 # カバレッジ付きで実行
-uv run --frozen pytest --cov=app --cov-report=term-missing
+uv run --frozen --all-extras pytest --cov=app --cov-report=term-missing
 
 # 特定のディレクトリやファイルのみ実行
-uv run --frozen pytest tests/domain/
-uv run --frozen pytest tests/infrastructure/test_domain_mappings.py
+uv run --frozen --all-extras pytest tests/domain/
+uv run --frozen --all-extras pytest tests/infrastructure/test_domain_mappings.py
 ```

@@ -25,7 +25,7 @@
 
 ### 3\. テスト要件
 
-- フレームワーク: `uv run --frozen pytest` を使用。
+- フレームワーク: `uv run --frozen --all-extras pytest` を使用。
 - 非同期テスト: `asyncio` ではなく、`anyio` を使用すること。
   非同期テストは `@pytest.mark.anyio` を付け、`tests/conftest.py` の
   `anyio_backend` fixture で `asyncio` バックエンドを選択する。
@@ -77,7 +77,7 @@
 
 #### 2\. 型チェック (Type Checking)
 
-- ツール: `uv run --frozen pyright`
+- ツール: `uv run --frozen --all-extras pyright`
 - 要件:
   - `Optional` 型に対しては明示的な `None` チェックを行うこと。
   - 文字列に対する型ナローイング（Type narrowing）を行うこと。
@@ -119,7 +119,7 @@
   - 既存のパターンに合わせる。
 - Pytest:
   - テストが `anyio` のpytest markを見つけられない場合、pytest実行コマンドの先頭に `PYTEST_DISABLE_PLUGIN_AUTOLOAD=""` を追加して試すこと。
-    例: `PYTEST_DISABLE_PLUGIN_AUTOLOAD="" uv run --frozen pytest`
+    例: `PYTEST_DISABLE_PLUGIN_AUTOLOAD="" uv run --frozen --all-extras pytest`
 
 ### 3\. ベストプラクティス
 

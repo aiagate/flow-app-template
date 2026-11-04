@@ -124,10 +124,13 @@ HTTP API / LINE / Worker は任意のエントリポイントであり、この�
    source .venv/bin/activate  # Windows(PS)の場合は .venv\Scripts\activate
    ```
 
-2. 依存関係をインストール:
+2. 依存関係をインストール（以下は全入口の開発用）:
+
+   APIだけ等の選択導入は[入口ごとの依存管理](docs/development/OPTIONAL_ENTRYPOINTS.md)を参照してください。
+   本番で不要なSDKを省く場合は、`--no-dev --extra api`等で必要な入口を指定します。
 
    ```bash
-   uv sync
+   uv sync --frozen --all-extras
    ```
 
 3. Pre-commit フックをインストール:
@@ -181,13 +184,13 @@ HTTP API / LINE / Worker は任意のエントリポイントであり、この�
    Discord Botを起動:
 
    ```bash
-   uv run start-bot
+   uv run --frozen --extra discord start-bot
    ```
 
    または、Web APIサーバーを起動:
 
    ```bash
-   uv run start-api
+   uv run --frozen --extra api start-api
    ```
 
 ## データベース管理
@@ -226,16 +229,16 @@ uv run alembic history
 
 ```bash
 # 全テスト実行（SQLite一時ファイル、デフォルト）
-TEST_DATABASE_URL=sqlite+aiosqlite:// uv run --frozen pytest
+TEST_DATABASE_URL=sqlite+aiosqlite:// uv run --frozen --all-extras pytest
 
 # PostgreSQL環境での実行例（※テスト用DBを指定すること）
-TEST_DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/test_db uv run --frozen pytest
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/test_db uv run --frozen --all-extras pytest
 
 # カバレッジ付きで実行
-uv run --frozen pytest --cov=app --cov-report=term-missing
+uv run --frozen --all-extras pytest --cov=app --cov-report=term-missing
 
 # 特定のテストファイルのみ実行
-uv run --frozen pytest tests/infrastructure/test_repositories.py
+uv run --frozen --all-extras pytest tests/infrastructure/test_repositories.py
 ```
 
 ## コード品質チェック
@@ -251,13 +254,13 @@ uv run ruff check .
 uv run ruff check . --fix
 
 # 型チェック
-uv run pyright
+uv run --all-extras pyright
 
 # 全チェック実行
 uv run ruff format . && \
 uv run ruff check . --fix && \
-uv run pyright && \
-uv run pytest
+uv run --all-extras pyright && \
+uv run --all-extras pytest
 ```
 
 ## Discord Developer Portal とサーバー権限の設定（最小権限）
