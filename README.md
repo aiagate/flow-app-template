@@ -12,6 +12,10 @@ HTTP API / LINE / Worker は任意のエントリポイントであり、この�
 アイデンティティではありません。新機能の追加手順は
 [機能追加ガイド](docs/development/ADDING_FEATURE.md) を参照してください。
 
+単純な業務処理、状態遷移を持つモデル、読み取り専用Queryの選び分けは
+[業務に応じた実装の選び方](docs/development/IMPLEMENTATION_CHOICES.md)を参照してください。
+集約・Value Object・汎用Repositoryは、すべての機能への必須条件ではありません。
+
 ## 特徴
 
 ### 1. **非同期処理の活用**

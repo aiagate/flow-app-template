@@ -80,7 +80,7 @@ indent-style = "space"
 [tool.pyright]
 typeCheckingMode = "strict"
 pythonVersion = "3.13"
-include = ["src/app", "tests", "alembic"]
+include = ["src/app", "tests", "alembic", "examples"]
 exclude = [
     "**/__pycache__",
     "**/node_modules",
