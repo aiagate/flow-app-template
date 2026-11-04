@@ -426,7 +426,7 @@ uv run alembic stamp head
 マイグレーション実行後は必ずテストを実行:
 
 ```bash
-uv run --frozen pytest
+uv run --frozen --all-extras pytest
 ```
 
 ### 6. コミット前の確認
@@ -438,7 +438,7 @@ uv run alembic downgrade -1
 uv run alembic upgrade head
 
 # テストを実行
-uv run --frozen pytest
+uv run --frozen --all-extras pytest
 
 # コードフォーマット
 uv run --frozen ruff format .

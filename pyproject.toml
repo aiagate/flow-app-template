@@ -8,22 +8,32 @@ dependencies = [
     "aiosqlite>=0.21.0",
     "alembic>=1.17.2",
     "asyncpg>=0.31.0",
-    "discord-py>=2.5.2",
-    "fastapi>=0.124.4",
     "flow-med>=0.2.0,<0.3.0",
     "flow-res==0.1.1",
     "injector>=0.22.0",
-    "line-bot-sdk>=3.23.0",
     "python-dotenv>=1.2.1",
     "python-ulid>=3.1.0",
     "sqlmodel>=0.0.24",
-    "uvicorn>=0.38.0",
 ]
 
 [project.scripts]
 start-bot = "app.presentation.bot.__main__:main"
 start-api = "app.presentation.api.__main__:start"
 start-line = "app.presentation.line.__main__:start"
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.124.4",
+    "uvicorn>=0.38.0",
+]
+discord = [
+    "discord-py>=2.5.2",
+]
+line = [
+    "fastapi>=0.124.4",
+    "line-bot-sdk>=3.23.0",
+    "uvicorn>=0.38.0",
+]
 
 [dependency-groups]
 dev = [

@@ -496,32 +496,13 @@ CreateとGetの結果をつなぐ実例は
 
 ## 依存関係管理
 
-### プロダクション依存関係
+依存とバージョンの正本は [`pyproject.toml`](../pyproject.toml) と `uv.lock` です。
 
-```toml
-[project.dependencies]
-aiosqlite = ">=0.21.0"
-alembic = ">=1.17.2"
-discord-py = ">=2.5.2"
-injector = ">=0.22.0"
-python-dotenv = ">=1.2.1"
-python-ulid = ">=3.1.0"   # ULID生成
-sqlmodel = ">=0.0.24"
-```
+- コア: DB、マイグレーション、DI、Mediator、Result型、環境変数ローダー。
+- 入口SDK: `api` / `discord` / `line` のoptional extras。Workerは追加SDK不要。
+- 開発用: `dev` dependency group。全入口のテスト・型検査には`--all-extras`を指定します。
 
-### 開発依存関係
-
-```toml
-[dependency-groups.dev]
-# anyio は pytest-asyncio の依存関係として導入されます
-pre-commit = ">=4.5.0"
-pyright = ">=1.1.407"
-pytest = ">=8.3.5"
-pytest-asyncio = ">=1.3.0" # 非同期テストランナー
-pytest-cov = ">=7.0.0"
-pytest-mock = ">=3.14.0"
-ruff = ">=0.14.6"
-```
+具体的なインストール・起動・CI経路は[入口ごとの依存管理](./development/OPTIONAL_ENTRYPOINTS.md)を参照してください。
 
 ---
 
