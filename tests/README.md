@@ -20,6 +20,7 @@
   - [`test_domain_mappings.py`](infrastructure/test_domain_mappings.py): ドメイン ↔ ORMマッパーの復元状態の完全性と不正データの拒否検証。
   - [`test_registration_completeness.py`](infrastructure/test_registration_completeness.py): ORMモデル・明示的マッピング・Handlerの登録漏れやVersion設定漏れを検出。
   - [`test_aggregate_persistence.py`](infrastructure/test_aggregate_persistence.py)（モデル定義: [`helpers/aggregate_persistence.py`](helpers/aggregate_persistence.py)）: 親子集約の完全スナップショット保存、実race競合検出とロールバック、専用RepositoryとUoWのトランザクション共有・ライフサイクル検証。
+- **`pbt/`**: 業務ルールの性質ベーステスト（Hypothesis）。実ハンドラ・実SQLiteに対する操作列の検査と、DB制約の直接検査。手順と保証範囲は [業務ルールを検証へつなぐ手順](../docs/development/VERIFICATION.md) を参照。
 - **`presentation/`**: プレゼンテーション層（Discord Bot Cog、Web API Router、Worker、LINE）のテスト。
   - [`bot/test_intents.py`](presentation/bot/test_intents.py): Bot が最小権限の Gateway Intents のみを使うことの回帰テスト。
   - [`test_entrypoint_environment.py`](presentation/test_entrypoint_environment.py): 各エントリポイントが共通環境ローダー（`app.environment`）を使うことの検証。
@@ -37,7 +38,7 @@
   - 接続ごとに外部キー制約（`PRAGMA foreign_keys=ON`）が有効化され、独立した接続でテストされます。
 - **`postgresql+asyncpg://...`**:
   - テストケースごとにUUIDを用いた独立スキーマ（`test_<uuid>`）が作成され、テスト終了時に自動的に削除（`DROP SCHEMA CASCADE`）されます。
-  - CI環境ではPostgreSQL 16サービス上で同一の全テストスイートが実行されます。
+  - CI環境ではPostgreSQL 16サービス上で `tests/pbt` を除くテストスイートが実行されます（PBTは自前の一時SQLiteを使うため、SQLite側でのみ実行されます）。
 
 > [!CAUTION]
 > PostgreSQLを指定する場合、必ず**テスト専用のデータベースURL**を指定してください。開発用・実運用のデータベースに向けて実行してはなりません。
