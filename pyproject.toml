@@ -38,6 +38,7 @@ line = [
 [dependency-groups]
 dev = [
     "anyio>=4.11.0",
+    "hypothesis>=6.170.14",
     "pre-commit>=4.5.0",
     "pyright>=1.1.407",
     "pytest>=8.3.5",
@@ -90,7 +91,7 @@ indent-style = "space"
 [tool.pyright]
 typeCheckingMode = "strict"
 pythonVersion = "3.13"
-include = ["src/app", "tests", "alembic", "examples"]
+include = ["src/app", "tests", "alembic", "examples", "formal"]
 exclude = [
     "**/__pycache__",
     "**/node_modules",

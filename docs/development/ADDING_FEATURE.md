@@ -18,6 +18,20 @@
 | **6. Migration** | `alembic/versions/<rev>_<desc>.py`<br>（※DBスキーマ変更がある場合のみ） | `alembic/` | 使い捨てDBでの検証コマンド群<br>`uv run alembic check` |
 | **7. 品質検証** | リポジトリ全体 | CI / Pre-commit | `TEST_DATABASE_URL=sqlite+aiosqlite:// uv run --frozen --all-extras pytest`<br>`uv run --frozen ruff format --check .`<br>`uv run --frozen ruff check .`<br>`uv run --frozen --all-extras pyright` |
 
+## 検証方法の選び方（必要な場合のみ）
+
+業務上の約束が状態遷移、入力の組合せ、操作順、複数行にまたがる整合性に関わる
+場合、例ベースのテストだけでは抜けやすい箇所があります。次を目安に手法を選びます。
+
+- 代表例で決まる入力・エラー分岐: 例ベースのテスト（従来どおり）
+- 入力の組合せ・境界値・操作順・履歴の保持: Property-based test
+- 実装から独立した不変条件、境界内の全状態: 実行可能な仕様モデルと全探索
+- 検査が壊れた実装を検出するか: 手動の変異確認（常用しない）
+
+具体例（TeamMembershipの加入・承認・退会・再加入）と実行コマンド、保証範囲、
+業務ルール変更の演習は [業務ルールを検証へつなぐ手順](./VERIFICATION.md) を参照して
+ください。すべての機能に形式モデルやPBTを要求するものではありません。
+
 ## 各要素が存在する理由と設計原則
 
 - **ORMの標準保存（`merge(load=True)` / `flush`）とドメイン変換の分離**:

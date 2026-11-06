@@ -51,15 +51,23 @@ jobs:
       - name: Run type checking with pyright
         run: uv run --frozen --all-extras pyright
 
+      # 仕様モデルの境界内全探索。DBに依存しないため、CIで1回だけ実行する。
+      - name: Run bounded specification model exploration
+        run: uv run --frozen python formal/explore.py --max-depth 8 --teams 1 --users 2
+
       - name: Run tests with SQLite
         env:
           TEST_DATABASE_URL: sqlite+aiosqlite://
         run: uv run --frozen --all-extras pytest --cov --cov-report=term-missing
 
+      # PBTハーネスは自前の一時SQLiteを使うため、PostgreSQL側では再実行しない。
       - name: Run tests with PostgreSQL
         env:
           TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/bot_test
-        run: uv run --frozen --all-extras pytest --cov --cov-report=term-missing
+        run: >-
+          uv run --frozen --all-extras pytest
+          --cov --cov-report=term-missing
+          --ignore=tests/pbt
 
   optional-extras:
     runs-on: ubuntu-latest

@@ -257,6 +257,10 @@ uv run --frozen --all-extras pytest --cov=app --cov-report=term-missing
 uv run --frozen --all-extras pytest tests/infrastructure/test_repositories.py
 ```
 
+`tests/pbt/` には業務ルールの性質ベーステスト（Hypothesis）があります。通常の
+`pytest` に含まれ、単体では約35〜40秒で完了します。実行方法と保証範囲は
+[業務ルールを検証へつなぐ手順](docs/development/VERIFICATION.md) を参照してください。
+
 ## コード品質チェック
 
 ```bash
@@ -366,6 +370,7 @@ Worker を含む全プロセスで**プロセスローカルなイベント配�
 プロジェクトの詳細なドキュメントは `docs/` ディレクトリにあります：
 
 - **[機能追加ガイド](docs/development/ADDING_FEATURE.md)** - 新機能・集約の追加手順（正本）
+- **[業務ルールを検証へつなぐ手順](docs/development/VERIFICATION.md)** - 不変条件・PBT・仕様モデル・変異確認の選び方と実行例
 - **[アーキテクチャ設計](docs/ARCHITECTURE.md)** - システム全体のアーキテクチャ詳細
 - **[Domain層実装ガイド](docs/domain/DOMAIN_IMPLEMENTATION_GUIDE.md)** - ドメインモデルの実装方法
 - **[データベースマイグレーション](docs/infrastructure/DATABASE_MIGRATIONS.md)** - Alembicによるマイグレーション管理
