@@ -15,14 +15,18 @@ import (
 type ErrorCode string
 
 const (
-	CodeValidation          ErrorCode = "VALIDATION_ERROR"
-	CodeInsufficientBalance ErrorCode = "INSUFFICIENT_BALANCE"
-	CodeNotFound            ErrorCode = "NOT_FOUND"
-	CodeConflict            ErrorCode = "CONFLICT"
-	CodeConcurrencyConflict ErrorCode = "CONCURRENCY_CONFLICT"
-	CodeRateLimited         ErrorCode = "RATE_LIMITED"
-	CodeRouteDisabled       ErrorCode = "ROUTE_DISABLED"
-	CodeUnexpected          ErrorCode = "UNEXPECTED"
+	CodeValidation           ErrorCode = "VALIDATION_ERROR"
+	CodeInsufficientBalance  ErrorCode = "INSUFFICIENT_BALANCE"
+	CodeNotFound             ErrorCode = "NOT_FOUND"
+	CodeConflict             ErrorCode = "CONFLICT"
+	CodeConcurrencyConflict  ErrorCode = "CONCURRENCY_CONFLICT"
+	CodeRateLimited          ErrorCode = "RATE_LIMITED"
+	CodeRouteDisabled        ErrorCode = "ROUTE_DISABLED"
+	CodeUnauthorized         ErrorCode = "UNAUTHORIZED"
+	CodeForbidden            ErrorCode = "FORBIDDEN"
+	CodeServiceUnavailable   ErrorCode = "SERVICE_UNAVAILABLE"
+	CodeUnsupportedMediaType ErrorCode = "UNSUPPORTED_MEDIA_TYPE"
+	CodeUnexpected           ErrorCode = "UNEXPECTED"
 )
 
 // UseCaseError carries a stable error code and a user-facing message. The
@@ -80,6 +84,16 @@ func ClassifyError(err error) *UseCaseError {
 		return WrapError(CodeRateLimited, "rate limit exceeded", err)
 	case errors.Is(err, domain.ErrRouteDisabled):
 		return WrapError(CodeRouteDisabled, "route is disabled", err)
+	case errors.Is(err, domain.ErrUnauthorized):
+		return WrapError(CodeUnauthorized, "authentication required", err)
+	case errors.Is(err, domain.ErrForbidden):
+		return WrapError(CodeForbidden, "access denied", err)
+	case errors.Is(err, domain.ErrTooManyAccounts):
+		return WrapError(CodeServiceUnavailable, "account capacity reached", err)
+	case errors.Is(err, port.ErrQueueFull):
+		return WrapError(CodeServiceUnavailable, "write queue is full", err)
+	case errors.Is(err, port.ErrQueueClosed):
+		return WrapError(CodeServiceUnavailable, "service is shutting down", err)
 	case errors.Is(err, port.ErrNotFound):
 		return WrapError(CodeNotFound, "resource not found", err)
 	case errors.Is(err, port.ErrAlreadyExists):

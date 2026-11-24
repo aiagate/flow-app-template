@@ -40,6 +40,12 @@ type QuotaRepository interface {
 	GetByAccountID(ctx context.Context, accountID string) (domain.AccountQuota, error)
 }
 
+// RuntimeConfigRepository loads and saves the single runtime configuration row.
+type RuntimeConfigRepository interface {
+	Load(ctx context.Context) (*domain.RuntimeConfig, bool, error)
+	Save(ctx context.Context, cfg *domain.RuntimeConfig) error
+}
+
 // AuditQuery reads append-only billing and request history.
 type AuditQuery interface {
 	ListBillingEvents(ctx context.Context, accountID string, limit int) ([]domain.BillingEvent, error)

@@ -60,47 +60,76 @@ func newAccountResponse(view usecase.AccountView) accountResponse {
 }
 
 func (h *Handler) getAccount(w http.ResponseWriter, r *http.Request) {
-	view, err := h.deps.Billing.GetAccount(r.Context(), r.PathValue("account_id"))
+	accountID, err := domain.ValidateAccountID(r.PathValue("account_id"))
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, usecase.ClassifyError(err))
+		return
+	}
+	if !h.requireAccountAccess(w, r, accountID) {
+		return
+	}
+	// The path account is authoritative for this response and its access log,
+	// even when an admin calls it without X-Account-ID.
+	w.Header().Set(accountIDHeader, accountID)
+	view, err := h.deps.Billing.GetAccount(r.Context(), accountID)
+	if err != nil {
+		h.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, newAccountResponse(view))
 }
 
 func (h *Handler) creditAccount(w http.ResponseWriter, r *http.Request) {
+	accountID, err := domain.ValidateAccountID(r.PathValue("account_id"))
+	if err != nil {
+		h.writeError(w, usecase.ClassifyError(err))
+		return
+	}
+	if !h.requireAccountAccess(w, r, accountID) {
+		return
+	}
+	w.Header().Set(accountIDHeader, accountID)
+
 	var request ledgerRequest
 	if err := decodeJSON(r, &request); err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	view, err := h.deps.Billing.CreditAccount(r.Context(), usecase.CreditAccountInput{
-		AccountID: r.PathValue("account_id"),
+		AccountID: accountID,
 		Amount:    request.Amount,
 		Reason:    request.Reason,
 		RequestID: requestIDFrom(r.Context()),
 	})
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, newAccountResponse(view))
 }
 
 func (h *Handler) chargeAccount(w http.ResponseWriter, r *http.Request) {
+	accountID, err := domain.ValidateAccountID(r.PathValue("account_id"))
+	if err != nil {
+		h.writeError(w, usecase.ClassifyError(err))
+		return
+	}
+	if !h.requireAccountAccess(w, r, accountID) {
+		return
+	}
 	var request ledgerRequest
 	if err := decodeJSON(r, &request); err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	view, err := h.deps.Billing.ChargeAccount(r.Context(), usecase.ChargeAccountInput{
-		AccountID: r.PathValue("account_id"),
+		AccountID: accountID,
 		Amount:    request.Amount,
 		Reason:    request.Reason,
 		RequestID: requestIDFrom(r.Context()),
 	})
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	// The guard authorized before the amount-specific debit; overwrite its
@@ -112,12 +141,36 @@ func (h *Handler) chargeAccount(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) listBillingEvents(w http.ResponseWriter, r *http.Request) {
 	limit, err := queryLimit(r, 100)
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
-	events, err := h.deps.Billing.ListBillingEvents(r.Context(), r.URL.Query().Get("account_id"), limit)
+
+	accountID := strings.TrimSpace(r.URL.Query().Get("account_id"))
+	principal, ok := principalFrom(r.Context())
+	if !ok {
+		h.writeError(w, usecase.NewError(usecase.CodeForbidden, "access denied"))
+		return
+	}
+	if !principal.IsAdmin {
+		if accountID == "" {
+			accountID = principal.AccountID
+		} else {
+			validated, validationErr := domain.ValidateAccountID(accountID)
+			if validationErr != nil {
+				h.writeError(w, usecase.ClassifyError(validationErr))
+				return
+			}
+			if validated != principal.AccountID {
+				h.writeError(w, usecase.NewError(usecase.CodeForbidden, "access denied"))
+				return
+			}
+			accountID = validated
+		}
+	}
+
+	events, err := h.deps.Billing.ListBillingEvents(r.Context(), accountID, limit)
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	response := billingEventsEnvelope{Events: make([]billingEventResponse, 0, len(events))}
@@ -130,12 +183,12 @@ func (h *Handler) listBillingEvents(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) listRequestLogs(w http.ResponseWriter, r *http.Request) {
 	limit, err := queryLimit(r, 100)
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	logs, err := h.deps.Billing.ListRequestLogs(r.Context(), limit)
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	response := requestLogsEnvelope{Logs: make([]requestLogResponse, 0, len(logs))}
@@ -175,4 +228,15 @@ func queryLimit(r *http.Request, fallback int) (int, error) {
 		return 0, usecase.NewError(usecase.CodeValidation, "limit must be an integer between 1 and 1000")
 	}
 	return limit, nil
+}
+
+// requireAccountAccess allows admins and the account's own principal. It writes
+// the 403 envelope itself so handlers only need the boolean result.
+func (h *Handler) requireAccountAccess(w http.ResponseWriter, r *http.Request, accountID string) bool {
+	principal, ok := principalFrom(r.Context())
+	if !ok || (!principal.IsAdmin && principal.AccountID != accountID) {
+		h.writeError(w, usecase.NewError(usecase.CodeForbidden, "access denied"))
+		return false
+	}
+	return true
 }

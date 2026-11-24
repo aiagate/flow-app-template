@@ -57,9 +57,9 @@ type ChargeAccountInput struct {
 // GetAccount returns the authoritative in-memory balance for an account. The
 // persisted quota supplies updated_at when it is available.
 func (b *BillingUseCase) GetAccount(ctx context.Context, accountID string) (AccountView, error) {
-	accountID = strings.TrimSpace(accountID)
-	if accountID == "" {
-		return AccountView{}, validationError("account_id", "must not be empty")
+	accountID, err := domain.ValidateAccountID(accountID)
+	if err != nil {
+		return AccountView{}, ClassifyError(err)
 	}
 
 	state, ok := b.guard.GetAccountState(accountID)
@@ -101,9 +101,12 @@ func (b *BillingUseCase) CreditAccount(ctx context.Context, input CreditAccountI
 		return AccountView{}, err
 	}
 
-	b.guard.Credit(accountID, input.Amount)
+	if err := b.guard.Credit(accountID, input.Amount); err != nil {
+		return AccountView{}, ClassifyError(err)
+	}
 	state, ok := b.guard.GetAccountState(accountID)
 	if !ok {
+		b.guard.RollbackCredit(accountID, input.Amount)
 		return AccountView{}, NewError(CodeUnexpected, "account state is unavailable")
 	}
 
@@ -123,7 +126,7 @@ func (b *BillingUseCase) CreditAccount(ctx context.Context, input CreditAccountI
 		OccurredAt: now,
 	}, view); err != nil {
 		// Undo the in-memory credit so the caller can safely retry.
-		_, _ = b.guard.Debit(accountID, input.Amount)
+		b.guard.RollbackCredit(accountID, input.Amount)
 		return AccountView{}, err
 	}
 	return view, nil
@@ -172,7 +175,15 @@ func (b *BillingUseCase) ChargeAccount(ctx context.Context, input ChargeAccountI
 // ListBillingEvents reads append-only ledger history, optionally filtered by
 // account.
 func (b *BillingUseCase) ListBillingEvents(ctx context.Context, accountID string, limit int) ([]domain.BillingEvent, error) {
-	events, err := b.audit.ListBillingEvents(ctx, strings.TrimSpace(accountID), limit)
+	accountID = strings.TrimSpace(accountID)
+	if accountID != "" {
+		validated, err := domain.ValidateAccountID(accountID)
+		if err != nil {
+			return nil, ClassifyError(err)
+		}
+		accountID = validated
+	}
+	events, err := b.audit.ListBillingEvents(ctx, accountID, limit)
 	if err != nil {
 		return nil, ClassifyError(err)
 	}
@@ -189,10 +200,7 @@ func (b *BillingUseCase) ListRequestLogs(ctx context.Context, limit int) ([]doma
 }
 
 func (b *BillingUseCase) enqueueMovement(event domain.BillingEvent, view AccountView) error {
-	if err := b.queue.EnqueueBilling(event); err != nil {
-		return ClassifyError(err)
-	}
-	if err := b.queue.EnqueueQuotaSync(domain.AccountQuota{
+	if err := b.queue.EnqueueBillingWithQuota(event, domain.AccountQuota{
 		AccountID:    view.AccountID,
 		Balance:      view.Balance,
 		RateLimitRPM: view.RateLimitRPM,
@@ -204,9 +212,9 @@ func (b *BillingUseCase) enqueueMovement(event domain.BillingEvent, view Account
 }
 
 func validateLedgerInput(accountID string, amount int64, reason string) (string, string, error) {
-	accountID = strings.TrimSpace(accountID)
-	if accountID == "" {
-		return "", "", validationError("account_id", "must not be empty")
+	accountID, err := domain.ValidateAccountID(accountID)
+	if err != nil {
+		return "", "", ClassifyError(err)
 	}
 	if amount <= 0 {
 		return "", "", validationError("amount", "must be positive")

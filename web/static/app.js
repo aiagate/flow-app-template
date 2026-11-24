@@ -2,6 +2,7 @@
 
 (() => {
   const ACCOUNT_STORAGE_KEY = 'flow-console.account-id';
+  const API_KEY_STORAGE_KEY = 'flow-console.api-key';
   const LIVE_REFRESH_MS = 5000;
   const DEFAULT_ACCOUNT = 'default';
   const DEFAULT_QUEUE_CAP = 8192;
@@ -33,6 +34,7 @@
 
   const state = {
     accountId: DEFAULT_ACCOUNT,
+    apiKey: '',
     health: null,
     stats: null,
     config: null,
@@ -267,12 +269,39 @@
     return '';
   }
 
+  function authStatusText(status) {
+    return status === 403
+      ? 'Access denied (403). Apply an API key for the account you are viewing.'
+      : 'API key required (401). Enter a valid bearer token and Apply.';
+  }
+
+  function promptForApiKey(status) {
+    const node = byId('api-key-status');
+    if (!node) return;
+    node.textContent = authStatusText(status);
+    node.className = 'small api-key-status api-key-status--warn';
+  }
+
+  function showApiKeyState() {
+    const node = byId('api-key-status');
+    if (!node) return;
+    if (state.apiKey) {
+      node.textContent = 'API key loaded from this tab';
+      node.className = 'small api-key-status api-key-status--ok';
+    } else {
+      node.textContent = 'No API key';
+      node.className = 'small api-key-status';
+    }
+  }
+
   async function api(path, options = {}) {
     const method = options.method || 'GET';
     const headers = {
       Accept: 'application/json',
       'X-Account-ID': sanitizeHeaderValue(state.accountId) || DEFAULT_ACCOUNT,
     };
+    const key = sanitizeHeaderValue(state.apiKey);
+    if (key) headers.Authorization = `Bearer ${key}`;
     if (options.body !== undefined) headers['Content-Type'] = 'application/json';
 
     const controller = new AbortController();
@@ -310,6 +339,9 @@
     }
 
     if (!response.ok) {
+      if (response.status === 401 || response.status === 403) {
+        promptForApiKey(response.status);
+      }
       const detail = messageFromPayload(payload) || response.statusText || 'Request failed';
       throw new ApiError(`${detail} (HTTP ${response.status})`, response.status, payload);
     }
@@ -501,6 +533,9 @@
 
     const readConns = pickNumber(state.stats, ['read_connections', 'read_conns', 'readConnections'], ['db', 'database']);
     setText('db-read-conns', displayNumber(readConns));
+
+    const walBytes = pickNumber(db, ['wal_bytes', 'walBytes'], []);
+    setText('db-wal-bytes', displayNumber(walBytes));
   }
 
   function renderStats() {
@@ -528,6 +563,8 @@
     metric('batcher-flushed', ['flushed', 'flushed_events', 'written', 'written_events'], ['batcher']);
     metric('batcher-flush-commits', ['flush_commits', 'flushcommits', 'commits', 'flush_count'], ['batcher']);
     metric('batcher-dropped', ['dropped', 'drop_count', 'dropped_events'], ['batcher']);
+    metric('batcher-pending', ['pending', 'pending_events'], ['batcher']);
+    metric('batcher-errors', ['errors', 'error_count', 'write_errors'], ['batcher']);
 
     const percent = Math.min(100, Math.max(0, (len / cap) * 100));
     const bar = byId('batcher-gauge');
@@ -547,10 +584,13 @@
     );
 
     const dropped = asNumber(droppedRaw, 0);
+    const writeErrors = asNumber(pickNumber(stats, ['errors', 'error_count', 'write_errors'], ['batcher']), 0);
     if (!stats) {
       setBadge('batcher-state', '—', 'neutral');
     } else if (dropped > 0) {
       setBadge('batcher-state', 'DROPS', 'danger');
+    } else if (writeErrors > 0) {
+      setBadge('batcher-state', 'ERRORS', 'danger');
     } else {
       setBadge('batcher-state', 'HEALTHY', 'success');
     }
@@ -1407,6 +1447,40 @@
     await loadMemberships({ silent });
   }
 
+  function applyApiKey(event) {
+    event.preventDefault();
+    const input = byId('api-key');
+    const next = sanitizeHeaderValue(input?.value);
+    if (!next) {
+      clearApiKey();
+      return;
+    }
+    state.apiKey = next;
+    try {
+      sessionStorage.setItem(API_KEY_STORAGE_KEY, next);
+    } catch {
+      // Session storage can be unavailable in hardened modes; the in-memory
+      // key still authenticates this tab's requests.
+    }
+    if (input) input.value = next;
+    showApiKeyState();
+    toast('API key applied for this tab.', 'success');
+    refreshAll();
+  }
+
+  function clearApiKey() {
+    state.apiKey = '';
+    try {
+      sessionStorage.removeItem(API_KEY_STORAGE_KEY);
+    } catch {
+      // Nothing to clear when storage is unavailable.
+    }
+    const input = byId('api-key');
+    if (input) input.value = '';
+    showApiKeyState();
+    toast('API key cleared.', 'info');
+  }
+
   function applyAccount(event) {
     event.preventDefault();
     const input = byId('account-id');
@@ -1427,6 +1501,8 @@
 
   function bindEvents() {
     byId('account-form')?.addEventListener('submit', applyAccount);
+    byId('api-key-form')?.addEventListener('submit', applyApiKey);
+    byId('api-key-clear')?.addEventListener('click', clearApiKey);
 
     byId('refresh-all')?.addEventListener('click', (event) => {
       withBusy(event.currentTarget, async () => {
@@ -1530,6 +1606,15 @@
     const billingAccount = byId('billing-account');
     if (billingAccount) billingAccount.value = saved;
     setText('account-id-display', saved);
+
+    try {
+      state.apiKey = sanitizeHeaderValue(sessionStorage.getItem(API_KEY_STORAGE_KEY));
+    } catch {
+      state.apiKey = '';
+    }
+    const keyInput = byId('api-key');
+    if (keyInput && state.apiKey) keyInput.value = state.apiKey;
+    showApiKeyState();
 
     bindEvents();
     setupScrollSpy();

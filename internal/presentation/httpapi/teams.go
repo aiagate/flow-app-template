@@ -46,12 +46,12 @@ func newTeamResponse(team *domain.Team) teamResponse {
 func (h *Handler) createTeam(w http.ResponseWriter, r *http.Request) {
 	var request createTeamRequest
 	if err := decodeJSON(r, &request); err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	team, err := h.deps.Teams.CreateTeam(r.Context(), usecase.CreateTeamInput{Name: request.Name})
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, teamEnvelope{Team: newTeamResponse(team)})
@@ -60,7 +60,7 @@ func (h *Handler) createTeam(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) listTeams(w http.ResponseWriter, r *http.Request) {
 	teams, err := h.deps.Teams.ListTeams(r.Context())
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	response := teamsEnvelope{Teams: make([]teamResponse, 0, len(teams))}
@@ -73,7 +73,7 @@ func (h *Handler) listTeams(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) getTeam(w http.ResponseWriter, r *http.Request) {
 	team, err := h.deps.Teams.GetTeam(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, teamEnvelope{Team: newTeamResponse(team)})
@@ -82,7 +82,7 @@ func (h *Handler) getTeam(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) updateTeam(w http.ResponseWriter, r *http.Request) {
 	var request updateTeamRequest
 	if err := decodeJSON(r, &request); err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	team, err := h.deps.Teams.UpdateTeam(r.Context(), usecase.UpdateTeamInput{
@@ -91,7 +91,7 @@ func (h *Handler) updateTeam(w http.ResponseWriter, r *http.Request) {
 		ExpectedVersion: request.ExpectedVersion,
 	})
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, teamEnvelope{Team: newTeamResponse(team)})

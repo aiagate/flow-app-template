@@ -10,6 +10,9 @@ type dbHealthResponse struct {
 	OK                bool   `json:"ok"`
 	JournalMode       string `json:"journal_mode"`
 	WALAutocheckpoint int64  `json:"wal_autocheckpoint"`
+	WALBytes          int64  `json:"wal_bytes"`
+	WALWarnBytes      int64  `json:"wal_warn_bytes"`
+	WALHealthy        bool   `json:"wal_healthy"`
 	ReadQueryOnly     bool   `json:"read_query_only"`
 	ReadConnections   int    `json:"read_connections"`
 }
@@ -24,6 +27,9 @@ func newDBHealthResponse(health domain.DBHealth) dbHealthResponse {
 		OK:                health.OK,
 		JournalMode:       health.JournalMode,
 		WALAutocheckpoint: health.WALAutocheckpoint,
+		WALBytes:          health.WALBytes,
+		WALWarnBytes:      health.WALWarnBytes,
+		WALHealthy:        health.WALHealthy,
 		ReadQueryOnly:     health.ReadQueryOnly,
 		ReadConnections:   health.ReadConnections,
 	}
@@ -32,12 +38,14 @@ func newDBHealthResponse(health domain.DBHealth) dbHealthResponse {
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	health, err := h.deps.Runtime.Health(r.Context())
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	status := "degraded"
+	code := http.StatusServiceUnavailable
 	if health.OK {
 		status = "ok"
+		code = http.StatusOK
 	}
-	writeJSON(w, http.StatusOK, healthResponse{Status: status, DB: newDBHealthResponse(health)})
+	writeJSON(w, code, healthResponse{Status: status, DB: newDBHealthResponse(health)})
 }

@@ -72,7 +72,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`,
 				name,
-				time.Now().UTC().Format(timestampLayout),
+				formatTimestamp(time.Now()),
 			); err != nil {
 				return fmt.Errorf("record migration %s: %w", name, err)
 			}

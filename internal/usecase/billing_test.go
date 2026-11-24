@@ -99,11 +99,14 @@ func TestCreditAccountRollsBackWhenTheQueueRejects(t *testing.T) {
 	queue.err = port.ErrQueueFull
 
 	_, err := billing.CreditAccount(ctx, CreditAccountInput{AccountID: "acct", Amount: 25, Reason: "top-up"})
-	assertCode(t, err, CodeUnexpected)
+	assertCode(t, err, CodeServiceUnavailable)
 
 	state, _ := guard.GetAccountState("acct")
 	if state.Balance != 100 {
 		t.Fatalf("balance = %d, want the credit rolled back to 100", state.Balance)
+	}
+	if len(queue.billing) != 0 || len(queue.quotas) != 0 {
+		t.Fatalf("failed credit persisted billing=%d quotas=%d", len(queue.billing), len(queue.quotas))
 	}
 }
 
@@ -169,11 +172,48 @@ func TestChargeAccountRefundsWhenTheQueueRejects(t *testing.T) {
 	queue.err = port.ErrQueueClosed
 
 	_, err := billing.ChargeAccount(ctx, ChargeAccountInput{AccountID: "acct", Amount: 20, Reason: "charge"})
-	assertCode(t, err, CodeUnexpected)
+	assertCode(t, err, CodeServiceUnavailable)
 
 	state, _ := guard.GetAccountState("acct")
 	if state.Balance != 50 {
 		t.Fatalf("balance = %d, want the charge refunded to 50", state.Balance)
+	}
+}
+
+func TestChargeAccountUnknownAccountIsNotFound(t *testing.T) {
+	ctx := context.Background()
+	billing, _, _, _, _ := newBillingForTest(map[string]int64{"acct": 100})
+
+	_, err := billing.ChargeAccount(ctx, ChargeAccountInput{AccountID: "missing", Amount: 1, Reason: "charge"})
+	assertCode(t, err, CodeNotFound)
+}
+
+func TestBillingRejectsInvalidAccountIDs(t *testing.T) {
+	ctx := context.Background()
+	billing, _, _, _, _ := newBillingForTest(map[string]int64{"acct": 100})
+
+	if _, err := billing.GetAccount(ctx, "bad account"); err == nil {
+		t.Fatal("GetAccount accepted an account ID with a space")
+	} else {
+		assertCode(t, err, CodeValidation)
+	}
+	if _, err := billing.CreditAccount(ctx, CreditAccountInput{AccountID: "acct\nid", Amount: 1, Reason: "top-up"}); err == nil {
+		t.Fatal("CreditAccount accepted an account ID with a newline")
+	} else {
+		assertCode(t, err, CodeValidation)
+	}
+	if _, err := billing.ChargeAccount(ctx, ChargeAccountInput{AccountID: "acct/id", Amount: 1, Reason: "charge"}); err == nil {
+		t.Fatal("ChargeAccount accepted an account ID with a slash")
+	} else {
+		assertCode(t, err, CodeValidation)
+	}
+	if _, err := billing.ListBillingEvents(ctx, "acct@id", 10); err == nil {
+		t.Fatal("ListBillingEvents accepted an account ID with an at sign")
+	} else {
+		assertCode(t, err, CodeValidation)
+	}
+	if _, err := billing.ListBillingEvents(ctx, "   ", 10); err != nil {
+		t.Fatalf("ListBillingEvents rejected an empty filter: %v", err)
 	}
 }
 

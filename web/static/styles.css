@@ -248,15 +248,20 @@ code {
   background: var(--accent-soft);
 }
 
-.account-picker {
+.account-picker,
+.key-picker {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  margin-left: auto;
   flex: 0 0 auto;
 }
 
-.account-picker label {
+.account-picker {
+  margin-left: auto;
+}
+
+.account-picker label,
+.key-picker label {
   color: var(--muted);
   font-family: var(--font-mono);
   font-size: 10px;
@@ -265,9 +270,23 @@ code {
   text-transform: uppercase;
 }
 
-.account-picker__controls {
+.account-picker__controls,
+.key-picker__controls {
   display: flex;
+  align-items: center;
   gap: 6px;
+}
+
+.api-key-status {
+  color: var(--muted);
+}
+
+.api-key-status--ok {
+  color: var(--success);
+}
+
+.api-key-status--warn {
+  color: var(--danger);
 }
 
 /* Layout ------------------------------------------------------------------ */
@@ -1400,6 +1419,14 @@ code {
     margin-left: auto;
   }
 
+  .key-picker {
+    width: 100%;
+  }
+
+  .key-picker__controls {
+    width: 100%;
+  }
+
   .hero {
     flex-direction: column;
     align-items: flex-start;
@@ -1447,6 +1474,14 @@ code {
   }
 
   .account-picker__controls {
+    width: 100%;
+  }
+
+  .key-picker {
+    width: 100%;
+  }
+
+  .key-picker__controls {
     width: 100%;
   }
 

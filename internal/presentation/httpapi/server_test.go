@@ -25,6 +25,22 @@ func withRequestIDHeader(requestID string) requestOption {
 	return func(r *http.Request) { r.Header.Set(requestIDHeader, requestID) }
 }
 
+func withAuthToken(token string) requestOption {
+	return func(r *http.Request) { r.Header.Set(authorizationHeader, "Bearer "+token) }
+}
+
+func withoutAuth() requestOption {
+	return func(r *http.Request) { r.Header.Del(authorizationHeader) }
+}
+
+func withContentType(contentType string) requestOption {
+	return func(r *http.Request) { r.Header.Set("Content-Type", contentType) }
+}
+
+func withoutContentType() requestOption {
+	return func(r *http.Request) { r.Header.Del("Content-Type") }
+}
+
 func call(t *testing.T, handler http.Handler, method, path string, body any, options ...requestOption) *httptest.ResponseRecorder {
 	t.Helper()
 
@@ -45,6 +61,7 @@ func call(t *testing.T, handler http.Handler, method, path string, body any, opt
 	}
 
 	request := httptest.NewRequest(method, path, reader)
+	request.Header.Set(authorizationHeader, "Bearer "+testAdminToken)
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
@@ -555,7 +572,7 @@ func TestRuntimeConfigAndGuardEndpoints(t *testing.T) {
 	assertStatus(t, call(t, env.handler, http.MethodGet, "/api/v1/users", nil, withAccount("broke")), http.StatusOK)
 
 	// Rate limit a fresh account on one route: two succeed, the third is 429.
-	env.guard.Credit("limited", 100)
+	_ = env.guard.Credit("limited", 100)
 	assertStatus(t, call(t, env.handler, http.MethodPut, "/api/v1/runtime/config", map[string]any{
 		"default_rate_limit_rpm": 120,
 		"default_request_cost":   1,
@@ -579,7 +596,7 @@ func TestRuntimeConfigAndGuardEndpoints(t *testing.T) {
 
 func TestGuardRefundsFiveHundredsAndPanicRecovery(t *testing.T) {
 	env := newTestEnvironment(t)
-	env.guard.Credit("refund", 10)
+	_ = env.guard.Credit("refund", 10)
 
 	beforeBilling, _, _ := env.queue.snapshot()
 	ctx := context.WithValue(context.Background(), accountIDContextKey, "refund")
@@ -587,7 +604,7 @@ func TestGuardRefundsFiveHundredsAndPanicRecovery(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/failing", nil).WithContext(ctx)
 	recorder := httptest.NewRecorder()
 
-	failing := env.handler.withGuard("GET /api/v1/failing", true, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	failing := env.handler.withGuard("GET /api/v1/failing", true, false, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	failing.ServeHTTP(recorder, request)
@@ -614,14 +631,18 @@ func TestGuardRefundsFiveHundredsAndPanicRecovery(t *testing.T) {
 
 func TestStatusForCode(t *testing.T) {
 	cases := map[usecase.ErrorCode]int{
-		usecase.CodeValidation:          http.StatusBadRequest,
-		usecase.CodeInsufficientBalance: http.StatusPaymentRequired,
-		usecase.CodeNotFound:            http.StatusNotFound,
-		usecase.CodeConflict:            http.StatusConflict,
-		usecase.CodeConcurrencyConflict: http.StatusConflict,
-		usecase.CodeRateLimited:         http.StatusTooManyRequests,
-		usecase.CodeRouteDisabled:       http.StatusServiceUnavailable,
-		usecase.CodeUnexpected:          http.StatusInternalServerError,
+		usecase.CodeValidation:           http.StatusBadRequest,
+		usecase.CodeUnauthorized:         http.StatusUnauthorized,
+		usecase.CodeForbidden:            http.StatusForbidden,
+		usecase.CodeInsufficientBalance:  http.StatusPaymentRequired,
+		usecase.CodeNotFound:             http.StatusNotFound,
+		usecase.CodeConflict:             http.StatusConflict,
+		usecase.CodeConcurrencyConflict:  http.StatusConflict,
+		usecase.CodeUnsupportedMediaType: http.StatusUnsupportedMediaType,
+		usecase.CodeRateLimited:          http.StatusTooManyRequests,
+		usecase.CodeRouteDisabled:        http.StatusServiceUnavailable,
+		usecase.CodeServiceUnavailable:   http.StatusServiceUnavailable,
+		usecase.CodeUnexpected:           http.StatusInternalServerError,
 	}
 	for code, want := range cases {
 		if got := statusForCode(code); got != want {

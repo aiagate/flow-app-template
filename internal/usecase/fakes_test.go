@@ -346,7 +346,10 @@ func (g *fakeGuard) Authorize(accountID, route string) (domain.HotPathDecision, 
 func (g *fakeGuard) Debit(accountID string, amount int64) (domain.HotPathDecision, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	state := g.accounts[accountID]
+	state, ok := g.accounts[accountID]
+	if !ok {
+		return domain.HotPathDecision{}, port.ErrNotFound
+	}
 	if state.Balance < amount {
 		g.stats.InsufficientBalance++
 		return domain.HotPathDecision{Allowed: false, Cost: amount, RemainingBalance: state.Balance}, domain.ErrInsufficientBalance
@@ -367,9 +370,9 @@ func (g *fakeGuard) Refund(accountID string, amount int64) {
 	g.accounts[accountID] = state
 }
 
-func (g *fakeGuard) Credit(accountID string, amount int64) {
+func (g *fakeGuard) Credit(accountID string, amount int64) error {
 	if amount <= 0 {
-		return
+		return nil
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -379,6 +382,18 @@ func (g *fakeGuard) Credit(accountID string, amount int64) {
 		state.RateLimitRPM = 120
 	}
 	state.Balance += amount
+	g.accounts[accountID] = state
+	return nil
+}
+
+func (g *fakeGuard) RollbackCredit(accountID string, amount int64) {
+	if amount <= 0 {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	state := g.accounts[accountID]
+	state.Balance -= amount
 	g.accounts[accountID] = state
 }
 
@@ -427,6 +442,18 @@ func (q *fakeQueue) EnqueueBilling(event domain.BillingEvent) error {
 	return nil
 }
 
+func (q *fakeQueue) EnqueueBillingWithQuota(event domain.BillingEvent, quota domain.AccountQuota) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.err != nil {
+		return q.err
+	}
+	q.billing = append(q.billing, event)
+	q.quotas = append(q.quotas, quota)
+	q.stats.Enqueued++
+	return nil
+}
+
 func (q *fakeQueue) EnqueueQuotaSync(quota domain.AccountQuota) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -436,6 +463,10 @@ func (q *fakeQueue) EnqueueQuotaSync(quota domain.AccountQuota) error {
 	q.quotas = append(q.quotas, quota)
 	q.stats.Enqueued++
 	return nil
+}
+
+func (q *fakeQueue) EnqueueQuotaSyncBlocking(_ context.Context, quota domain.AccountQuota) error {
+	return q.EnqueueQuotaSync(quota)
 }
 
 func (q *fakeQueue) EnqueueRequestLog(logRow domain.RequestLog) error {
@@ -509,4 +540,40 @@ type fakeHealth struct {
 
 func (h fakeHealth) Health(context.Context) (domain.DBHealth, error) {
 	return h.health, h.err
+}
+
+// fakeRuntimeConfig records the saved snapshot. onSave runs at the start of the
+// save so tests can observe whether the in-memory guard was mutated first.
+type fakeRuntimeConfig struct {
+	mu      sync.Mutex
+	saved   *domain.RuntimeConfig
+	saveErr error
+	onSave  func()
+	loadErr error
+	loadOK  bool
+}
+
+func (f *fakeRuntimeConfig) Load(context.Context) (*domain.RuntimeConfig, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.loadErr != nil {
+		return nil, false, f.loadErr
+	}
+	return f.saved.Clone(), f.loadOK, nil
+}
+
+func (f *fakeRuntimeConfig) Save(_ context.Context, cfg *domain.RuntimeConfig) error {
+	f.mu.Lock()
+	onSave := f.onSave
+	f.mu.Unlock()
+	if onSave != nil {
+		onSave()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.saveErr != nil {
+		return f.saveErr
+	}
+	f.saved = cfg.Clone()
+	return nil
 }

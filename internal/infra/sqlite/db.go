@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -21,9 +22,11 @@ import (
 )
 
 const (
-	defaultReadConns = 5
-	minReadConns     = 4
-	maxReadConns     = 6
+	defaultReadConns     = 5
+	minReadConns         = 4
+	maxReadConns         = 6
+	defaultWALWarnBytes  = int64(64 << 20)
+	timestampWriteLayout = "2006-01-02T15:04:05.000000000Z"
 )
 
 // Store owns the single write pool and the read-only read pool.
@@ -31,8 +34,10 @@ type Store struct {
 	WriteDB *sql.DB
 	ReadDB  *sql.DB
 
-	writeMu   sync.Mutex
-	readConns int
+	dbPath       string
+	walWarnBytes atomic.Int64
+	writeMu      sync.Mutex
+	readConns    int
 }
 
 // Open builds the database path, opens and migrates the write pool first, and
@@ -48,7 +53,7 @@ func Open(ctx context.Context, dbPath string, readConns int) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve database path: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o750); err != nil {
 		return nil, fmt.Errorf("create database directory: %w", err)
 	}
 	uri := "file:" + filepath.ToSlash(absPath)
@@ -70,7 +75,8 @@ func Open(ctx context.Context, dbPath string, readConns int) (*Store, error) {
 	writeDB.SetMaxIdleConns(1)
 	writeDB.SetConnMaxLifetime(0)
 
-	store := &Store{WriteDB: writeDB, readConns: readConns}
+	store := &Store{WriteDB: writeDB, dbPath: absPath, readConns: readConns}
+	store.walWarnBytes.Store(defaultWALWarnBytes)
 	if err := writeDB.PingContext(ctx); err != nil {
 		_ = writeDB.Close()
 		return nil, fmt.Errorf("ping write database: %w", err)
@@ -158,6 +164,16 @@ func (s *Store) withWriteTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	return nil
 }
 
+// SetWALWarnBytes sets the WAL size threshold reported by Health. A value at or
+// below zero disables the threshold.
+func (s *Store) SetWALWarnBytes(bytes int64) {
+	if bytes > 0 {
+		s.walWarnBytes.Store(bytes)
+		return
+	}
+	s.walWarnBytes.Store(0)
+}
+
 // Health reads the effective settings from live connections rather than
 // trusting the DSN text.
 func (s *Store) Health(ctx context.Context) (domain.DBHealth, error) {
@@ -174,12 +190,34 @@ func (s *Store) Health(ctx context.Context) (domain.DBHealth, error) {
 	if err := s.ReadDB.QueryRowContext(ctx, "PRAGMA query_only").Scan(&queryOnly); err != nil {
 		return domain.DBHealth{}, fmt.Errorf("read query_only: %w", err)
 	}
+	walBytes, err := s.walSize()
+	if err != nil {
+		return domain.DBHealth{}, err
+	}
+	warnBytes := s.walWarnBytes.Load()
+	walHealthy := warnBytes <= 0 || walBytes <= warnBytes
+
 	health.JournalMode = journalMode
 	health.WALAutocheckpoint = walAutocheckpoint
+	health.WALBytes = walBytes
+	health.WALWarnBytes = warnBytes
+	health.WALHealthy = walHealthy
 	health.ReadQueryOnly = queryOnly == 1
 	health.ReadConnections = s.readConns
-	health.OK = strings.EqualFold(journalMode, "wal") && walAutocheckpoint == 0 && queryOnly == 1
+	health.OK = strings.EqualFold(journalMode, "wal") && walAutocheckpoint == 0 &&
+		queryOnly == 1 && walHealthy
 	return health, nil
+}
+
+func (s *Store) walSize() (int64, error) {
+	info, err := os.Stat(s.dbPath + "-wal")
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("stat WAL file: %w", err)
+	}
+	return info.Size(), nil
 }
 
 // WriteBatch implements port.BatchSink. Every insert in the payload commits in
@@ -303,10 +341,9 @@ var (
 	_ port.DBHealthChecker = (*Store)(nil)
 )
 
-// timestampLayout is the canonical persisted form: UTC RFC3339 with
-// nanosecond precision.
-const timestampLayout = time.RFC3339Nano
-
+// formatTimestamp renders t in the canonical fixed-width UTC form so TEXT
+// ordering matches chronological ordering. Parsing stays on RFC3339Nano for
+// legacy rows.
 func formatTimestamp(t time.Time) string {
-	return t.UTC().Format(timestampLayout)
+	return t.UTC().Format(timestampWriteLayout)
 }

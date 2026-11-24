@@ -104,7 +104,7 @@ func ruleFor(relDir string) (dependencyRule, bool) {
 				"net/http":     "domain must not depend on transport",
 			},
 		}, true
-	case "internal/contract/port", "internal/contract/message":
+	case "internal/contract/port":
 		return dependencyRule{
 			name:          relDir,
 			allowInternal: func(path string) bool { return path == "internal/domain" },

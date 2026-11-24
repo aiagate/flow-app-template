@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aiagate/flow-app-template/internal/domain"
 )
 
 const (
@@ -24,6 +26,9 @@ const (
 	defaultRateLimitRPM    = 120
 	defaultRequestCost     = int64(1)
 	defaultShutdownTimeout = 10 * time.Second
+	defaultDrainTimeout    = 10 * time.Second
+	defaultWALWarnBytes    = int64(64 << 20)
+	defaultMaxAccounts     = 4096
 )
 
 // Config is the validated application configuration consumed by the
@@ -36,6 +41,11 @@ type Config struct {
 	DefaultRateLimitRPM   int
 	DefaultRequestCost    int64
 	ShutdownTimeout       time.Duration
+	AdminAPIKey           string
+	AccountAPIKeys        map[string]string
+	DrainTimeout          time.Duration
+	WALWarnBytes          int64
+	MaxAccounts           int
 }
 
 // Load reads .env.local then .env from the project root (or the current
@@ -64,6 +74,15 @@ func Load() (Config, error) {
 	dbPath := envValue("DB_PATH", defaultDBPath)
 	if dbPath == "" {
 		return Config{}, fmt.Errorf("DB_PATH must not be empty")
+	}
+
+	adminAPIKey := strings.TrimSpace(os.Getenv("ADMIN_API_KEY"))
+	if adminAPIKey == "" {
+		return Config{}, fmt.Errorf("ADMIN_API_KEY must not be empty")
+	}
+	accountAPIKeys, err := parseAccountAPIKeys(os.Getenv("API_KEYS"), adminAPIKey)
+	if err != nil {
+		return Config{}, err
 	}
 
 	readConns, err := envInt("DB_READ_CONNS", defaultDBReadConns)
@@ -109,6 +128,30 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must be positive")
 	}
 
+	drainTimeout, err := envDuration("DRAIN_TIMEOUT", defaultDrainTimeout)
+	if err != nil {
+		return Config{}, err
+	}
+	if drainTimeout <= 0 {
+		return Config{}, fmt.Errorf("DRAIN_TIMEOUT must be positive")
+	}
+
+	walWarnBytes, err := envInt64("WAL_WARN_BYTES", defaultWALWarnBytes)
+	if err != nil {
+		return Config{}, err
+	}
+	if walWarnBytes <= 0 {
+		return Config{}, fmt.Errorf("WAL_WARN_BYTES must be positive")
+	}
+
+	maxAccounts, err := envInt("MAX_ACCOUNTS", defaultMaxAccounts)
+	if err != nil {
+		return Config{}, err
+	}
+	if maxAccounts <= 0 {
+		return Config{}, fmt.Errorf("MAX_ACCOUNTS must be positive")
+	}
+
 	return Config{
 		HTTPAddr:              httpAddr,
 		DBPath:                dbPath,
@@ -117,7 +160,56 @@ func Load() (Config, error) {
 		DefaultRateLimitRPM:   rateLimitRPM,
 		DefaultRequestCost:    requestCost,
 		ShutdownTimeout:       timeout,
+		AdminAPIKey:           adminAPIKey,
+		AccountAPIKeys:        accountAPIKeys,
+		DrainTimeout:          drainTimeout,
+		WALWarnBytes:          walWarnBytes,
+		MaxAccounts:           maxAccounts,
 	}, nil
+}
+
+// parseAccountAPIKeys parses the optional comma-separated account_id:secret
+// list. Blank input yields no accounts so authentication only exposes admin.
+func parseAccountAPIKeys(raw, adminAPIKey string) (map[string]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+
+	keys := make(map[string]string)
+	tokens := make(map[string]string)
+	for i, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			return nil, fmt.Errorf("API_KEYS must not contain an empty entry")
+		}
+		rawAccountID, secret, ok := strings.Cut(entry, ":")
+		if !ok {
+			// Never echo the entry: without a separator it may be a bare
+			// secret rather than a malformed account_id:secret pair.
+			return nil, fmt.Errorf("API_KEYS entry %d must use account_id:secret format", i+1)
+		}
+		accountID, err := domain.ValidateAccountID(rawAccountID)
+		if err != nil {
+			return nil, fmt.Errorf("API_KEYS has an invalid account_id %q: %w", strings.TrimSpace(rawAccountID), err)
+		}
+		secret = strings.TrimSpace(secret)
+		if secret == "" {
+			return nil, fmt.Errorf("API_KEYS secret for account %q must not be empty", accountID)
+		}
+		if _, exists := keys[accountID]; exists {
+			return nil, fmt.Errorf("API_KEYS contains duplicate account_id %q", accountID)
+		}
+		if otherAccountID, exists := tokens[secret]; exists {
+			return nil, fmt.Errorf("API_KEYS token for account %q is already used by account %q", accountID, otherAccountID)
+		}
+		if secret == adminAPIKey {
+			return nil, fmt.Errorf("API_KEYS token for account %q must not equal ADMIN_API_KEY", accountID)
+		}
+		keys[accountID] = secret
+		tokens[secret] = accountID
+	}
+	return keys, nil
 }
 
 func envValue(key, fallback string) string {

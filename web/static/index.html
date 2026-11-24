@@ -40,6 +40,16 @@
         </div>
         <span class="visually-hidden" id="account-hint">Sets the X-Account-ID header on every API request. Press Enter or Apply to switch accounts.</span>
       </form>
+
+      <form class="key-picker" id="api-key-form" autocomplete="off">
+        <label for="api-key">API key</label>
+        <div class="key-picker__controls">
+          <input class="input input--compact" id="api-key" name="api-key" type="password" placeholder="Bearer token" spellcheck="false" autocapitalize="off" aria-describedby="api-key-status">
+          <button class="btn btn--primary btn--sm" type="submit">Apply</button>
+          <button class="btn btn--ghost btn--sm" id="api-key-clear" type="button">Clear</button>
+        </div>
+        <span class="small api-key-status" id="api-key-status" role="status" aria-live="polite">No API key</span>
+      </form>
     </div>
   </header>
 
@@ -100,6 +110,10 @@
             <div class="metric-row">
               <dt>Read pool connections</dt>
               <dd class="mono" id="db-read-conns">—</dd>
+            </div>
+            <div class="metric-row">
+              <dt>WAL size</dt>
+              <dd class="mono" id="db-wal-bytes">—</dd>
             </div>
           </dl>
           <p class="card-note">Checkpoints are delegated to Litestream; the writer keeps <span class="mono">wal_autocheckpoint = 0</span>.</p>
@@ -170,6 +184,14 @@
             <div class="tile">
               <span class="tile-label">Dropped</span>
               <strong class="tile-value tile-value--danger" id="batcher-dropped">—</strong>
+            </div>
+            <div class="tile">
+              <span class="tile-label">Pending</span>
+              <strong class="tile-value" id="batcher-pending">—</strong>
+            </div>
+            <div class="tile">
+              <span class="tile-label">Write errors</span>
+              <strong class="tile-value tile-value--danger" id="batcher-errors">—</strong>
             </div>
           </div>
           <p class="card-note">Group commits flush every 15 ms or at 64 events in a single SQLite transaction.</p>
@@ -250,7 +272,7 @@
         <form class="inline-form" id="route-add-form" autocomplete="off">
           <div class="field field--grow">
             <label for="route-add-name">Add route override</label>
-            <input class="input" id="route-add-name" name="route" type="text" placeholder="/api/v1/example" spellcheck="false">
+            <input class="input" id="route-add-name" name="route" type="text" placeholder="GET /api/v1/users" spellcheck="false">
           </div>
           <button class="btn btn--ghost" type="submit">Add route</button>
         </form>

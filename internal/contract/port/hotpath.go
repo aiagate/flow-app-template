@@ -16,7 +16,14 @@ type HotPathGuard interface {
 	// and moves funds but does not apply route policy or rate limiting again.
 	Debit(accountID string, amount int64) (domain.HotPathDecision, error)
 	Refund(accountID string, amount int64)
-	Credit(accountID string, amount int64)
+	// Credit adds funds after a successful top-up. An unknown account is
+	// created with exactly the credited amount. It reports an error for an
+	// invalid account ID, when the account capacity limit is reached, or when
+	// the resulting balance would overflow int64.
+	Credit(accountID string, amount int64) error
+	// RollbackCredit reverses a Credit when the corresponding persistence
+	// operation fails.
+	RollbackCredit(accountID string, amount int64)
 	GetAccountState(accountID string) (domain.AccountState, bool)
 	Hydrate(quotas []domain.AccountQuota)
 	Stats() domain.HotPathStats

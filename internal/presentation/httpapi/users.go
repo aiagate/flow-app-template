@@ -49,7 +49,7 @@ func newUserResponse(user *domain.User) userResponse {
 func (h *Handler) createUser(w http.ResponseWriter, r *http.Request) {
 	var request createUserRequest
 	if err := decodeJSON(r, &request); err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	user, err := h.deps.Users.CreateUser(r.Context(), usecase.CreateUserInput{
@@ -57,7 +57,7 @@ func (h *Handler) createUser(w http.ResponseWriter, r *http.Request) {
 		Email:       request.Email,
 	})
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, userEnvelope{User: newUserResponse(user)})
@@ -66,7 +66,7 @@ func (h *Handler) createUser(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) listUsers(w http.ResponseWriter, r *http.Request) {
 	users, err := h.deps.Users.ListUsers(r.Context())
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	response := usersEnvelope{Users: make([]userResponse, 0, len(users))}
@@ -79,7 +79,7 @@ func (h *Handler) listUsers(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) getUser(w http.ResponseWriter, r *http.Request) {
 	user, err := h.deps.Users.GetUser(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, userEnvelope{User: newUserResponse(user)})
@@ -88,7 +88,7 @@ func (h *Handler) getUser(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) changeUserEmail(w http.ResponseWriter, r *http.Request) {
 	var request changeUserEmailRequest
 	if err := decodeJSON(r, &request); err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	user, err := h.deps.Users.ChangeUserEmail(r.Context(), usecase.ChangeUserEmailInput{
@@ -97,7 +97,7 @@ func (h *Handler) changeUserEmail(w http.ResponseWriter, r *http.Request) {
 		ExpectedVersion: request.ExpectedVersion,
 	})
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, userEnvelope{User: newUserResponse(user)})

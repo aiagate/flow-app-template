@@ -3,6 +3,7 @@ package hotpath
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -387,31 +388,42 @@ func TestCreditAndRefund(t *testing.T) {
 		t.Fatal("account exists before first operation")
 	}
 
-	store.Credit("acct", 5)
+	// An unknown account starts from zero plus the credited amount; it does not
+	// inherit the configured initial balance.
+	if err := store.Credit("acct", 5); err != nil {
+		t.Fatalf("Credit: %v", err)
+	}
 	state, ok := store.GetAccountState("acct")
-	if !ok || state.Balance != 15 || state.RateLimitRPM != 100 {
+	if !ok || state.Balance != 5 || state.RateLimitRPM != 100 {
 		t.Fatalf("state after credit = %+v, ok=%v", state, ok)
 	}
 	store.Refund("acct", 3)
 	state, _ = store.GetAccountState("acct")
-	if state.Balance != 18 {
-		t.Fatalf("balance after refund = %d, want 18", state.Balance)
+	if state.Balance != 8 {
+		t.Fatalf("balance after refund = %d, want 8", state.Balance)
 	}
 
 	// Non-positive movements are ignored.
-	store.Credit("acct", 0)
-	store.Credit("acct", -4)
+	if err := store.Credit("acct", 0); err != nil {
+		t.Fatalf("zero Credit: %v", err)
+	}
+	if err := store.Credit("acct", -4); err != nil {
+		t.Fatalf("negative Credit: %v", err)
+	}
 	store.Refund("acct", -1)
 	state, _ = store.GetAccountState("acct")
-	if state.Balance != 18 {
-		t.Fatalf("balance after no-op movements = %d, want 18", state.Balance)
+	if state.Balance != 8 {
+		t.Fatalf("balance after no-op movements = %d, want 8", state.Balance)
 	}
 
-	// Credit lazily creates an unknown account from the configured defaults.
-	store.Credit("new", 7)
+	// Credit lazily creates an unknown account with exactly the credited
+	// amount, not initial balance + amount.
+	if err := store.Credit("new", 7); err != nil {
+		t.Fatalf("Credit new: %v", err)
+	}
 	state, ok = store.GetAccountState("new")
-	if !ok || state.Balance != 17 || state.RateLimitRPM != 100 {
-		t.Fatalf("lazy credited account = %+v, ok=%v", state, ok)
+	if !ok || state.Balance != 7 || state.RateLimitRPM != 100 {
+		t.Fatalf("lazy credited account = %+v, ok=%v; want balance 7", state, ok)
 	}
 
 	if got := store.totalCredited.Load(); got != 12 {
@@ -419,6 +431,29 @@ func TestCreditAndRefund(t *testing.T) {
 	}
 	if got := store.totalRefunded.Load(); got != 3 {
 		t.Fatalf("totalRefunded = %d, want 3", got)
+	}
+}
+
+func TestCreditRejectsOverflowWithoutMutating(t *testing.T) {
+	store := New(Options{InitialBalance: 0, DefaultRateLimitRPM: 100})
+
+	if err := store.Credit("acct", math.MaxInt64); err != nil {
+		t.Fatalf("Credit max balance: %v", err)
+	}
+	err := store.Credit("acct", 1)
+	if err == nil {
+		t.Fatal("Credit succeeded past math.MaxInt64")
+	}
+	if !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("Credit error = %v, want domain.ErrValidation", err)
+	}
+
+	state, ok := store.GetAccountState("acct")
+	if !ok || state.Balance != math.MaxInt64 {
+		t.Fatalf("balance after rejected credit = %+v, ok=%v; want %d", state, ok, int64(math.MaxInt64))
+	}
+	if got := store.totalCredited.Load(); got != math.MaxInt64 {
+		t.Fatalf("totalCredited = %d, want %d", got, int64(math.MaxInt64))
 	}
 }
 
@@ -591,6 +626,9 @@ func TestRefundConcurrentConservation(t *testing.T) {
 	)
 	store := New(Options{InitialBalance: initial, DefaultRateLimitRPM: 1_000_000})
 	store.UpdateConfig(testConfig(1_000_000, 0))
+	// Seed the account so the concurrent credits increase the existing balance
+	// instead of creating it from zero.
+	store.Hydrate([]domain.AccountQuota{{AccountID: "acct", Balance: initial, RateLimitRPM: 1_000_000}})
 
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {

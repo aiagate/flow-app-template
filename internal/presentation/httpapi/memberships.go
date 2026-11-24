@@ -59,7 +59,7 @@ func (h *Handler) requestJoinTeam(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) createMembership(w http.ResponseWriter, r *http.Request, pending bool) {
 	var request joinMembershipRequest
 	if err := decodeJSON(r, &request); err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	ctx := r.Context()
@@ -77,7 +77,7 @@ func (h *Handler) createMembership(w http.ResponseWriter, r *http.Request, pendi
 		membership, err = h.deps.Memberships.JoinTeam(ctx, input)
 	}
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, membershipEnvelope{Membership: newMembershipResponse(membership)})
@@ -86,7 +86,7 @@ func (h *Handler) createMembership(w http.ResponseWriter, r *http.Request, pendi
 func (h *Handler) listTeamMemberships(w http.ResponseWriter, r *http.Request) {
 	memberships, err := h.deps.Memberships.ListTeamMemberships(r.Context(), r.PathValue("team_id"))
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	response := membershipsEnvelope{Memberships: make([]membershipResponse, 0, len(memberships))}
@@ -99,7 +99,7 @@ func (h *Handler) listTeamMemberships(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) approveJoinRequest(w http.ResponseWriter, r *http.Request) {
 	membership, err := h.deps.Memberships.ApproveJoinRequest(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, membershipEnvelope{Membership: newMembershipResponse(membership)})
@@ -108,7 +108,7 @@ func (h *Handler) approveJoinRequest(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) leaveTeam(w http.ResponseWriter, r *http.Request) {
 	membership, err := h.deps.Memberships.LeaveTeam(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, membershipEnvelope{Membership: newMembershipResponse(membership)})
@@ -117,12 +117,12 @@ func (h *Handler) leaveTeam(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) changeRole(w http.ResponseWriter, r *http.Request) {
 	var request changeRoleRequest
 	if err := decodeJSON(r, &request); err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	membership, err := h.deps.Memberships.ChangeRole(r.Context(), r.PathValue("id"), request.Role)
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, membershipEnvelope{Membership: newMembershipResponse(membership)})

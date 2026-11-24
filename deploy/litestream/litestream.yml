@@ -1,11 +1,10 @@
 # Litestream v0.5.x configuration for Cloudflare R2.
-# Environment variables come from /etc/flow-api/flow-api.env via systemd.
+# Environment variables come from /etc/flow-api/litestream.env via systemd.
 # Syntax deliberately uses v0.5 keys: l0-retention, snapshot, retention object,
 # and a singular replica (the v0.3 scalar retention and replicas list are gone).
 
-sync-interval: 10s
 l0-retention: 24h
-l0-retention-check-interval: 15s
+l0-retention-check-interval: 5m
 
 snapshot:
   interval: 24h

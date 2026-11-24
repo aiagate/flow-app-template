@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -224,6 +225,15 @@ func TestHealth(t *testing.T) {
 	if health.ReadConnections != 5 {
 		t.Errorf("ReadConnections = %d, want 5", health.ReadConnections)
 	}
+	if health.WALBytes < 0 {
+		t.Errorf("WALBytes = %d, want non-negative", health.WALBytes)
+	}
+	if health.WALWarnBytes != 64<<20 {
+		t.Errorf("WALWarnBytes = %d, want %d", health.WALWarnBytes, int64(64<<20))
+	}
+	if !health.WALHealthy {
+		t.Errorf("WALHealthy = false, WALBytes = %d, WALWarnBytes = %d", health.WALBytes, health.WALWarnBytes)
+	}
 }
 
 func TestMigrationSchemaAndIdempotence(t *testing.T) {
@@ -238,12 +248,13 @@ func TestMigrationSchemaAndIdempotence(t *testing.T) {
 	if err := store.ReadDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&migrationCount); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if migrationCount != 1 {
-		t.Fatalf("schema_migrations count = %d, want 1", migrationCount)
+	if migrationCount != 2 {
+		t.Fatalf("schema_migrations count = %d, want 2", migrationCount)
 	}
 
 	tables := []string{
 		"users", "teams", "team_memberships", "account_quotas", "billing_events", "request_logs",
+		"runtime_config",
 	}
 	for _, table := range tables {
 		var name string
@@ -929,8 +940,8 @@ func TestOpenCreatesParentAndReopensExistingDatabase(t *testing.T) {
 	if err := second.ReadDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&migrationsApplied); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if migrationsApplied != 1 {
-		t.Fatalf("schema_migrations count = %d, want 1", migrationsApplied)
+	if migrationsApplied != 2 {
+		t.Fatalf("schema_migrations count = %d, want 2", migrationsApplied)
 	}
 }
 
@@ -993,5 +1004,257 @@ func TestOpenRejectsEmptyPath(t *testing.T) {
 	}
 	if _, err := Open(context.Background(), "", 5); err == nil {
 		t.Fatal("Open with empty path succeeded, want error")
+	}
+}
+
+func TestTimestampOrderingUsesFixedWidthUTC(t *testing.T) {
+	store := openTestStore(t, 5)
+	ctx := context.Background()
+	audit := NewAuditQuery(store)
+
+	base := time.Date(2026, time.November, 24, 6, 56, 0, 0, time.UTC)
+	half := base.Add(500 * time.Millisecond)
+	beforeEvent := domain.BillingEvent{
+		ID: domain.NewEventID(), AccountID: "acct_order", Amount: -1,
+		Reason: "request", RequestID: "req_before", OccurredAt: base,
+	}
+	afterEvent := domain.BillingEvent{
+		ID: domain.NewEventID(), AccountID: "acct_order", Amount: -1,
+		Reason: "request", RequestID: "req_after", OccurredAt: half,
+	}
+	if err := store.WriteBatch(ctx, port.BatchPayload{
+		BillingEvents: []domain.BillingEvent{beforeEvent, afterEvent},
+		RequestLogs: []domain.RequestLog{
+			{
+				ID: "log_before", RequestID: "req_before", AccountID: "acct_order",
+				Method: "GET", Path: "/before", StatusCode: 200, OccurredAt: base,
+			},
+			{
+				ID: "log_after", RequestID: "req_after", AccountID: "acct_order",
+				Method: "GET", Path: "/after", StatusCode: 200, OccurredAt: half,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+
+	events, err := audit.ListBillingEvents(ctx, "acct_order", 10)
+	if err != nil {
+		t.Fatalf("ListBillingEvents: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("billing event count = %d, want 2", len(events))
+	}
+	if events[0].ID != afterEvent.ID {
+		t.Fatalf("billing order = %s first, want .5s event %s", events[0].ID, afterEvent.ID)
+	}
+	if events[1].ID != beforeEvent.ID {
+		t.Fatalf("billing order = %s second, want .0s event %s", events[1].ID, beforeEvent.ID)
+	}
+
+	logs, err := audit.ListRequestLogs(ctx, "acct_order", 10)
+	if err != nil {
+		t.Fatalf("ListRequestLogs: %v", err)
+	}
+	if len(logs) != 2 {
+		t.Fatalf("request log count = %d, want 2", len(logs))
+	}
+	if logs[0].ID != "log_after" {
+		t.Fatalf("request log order = %s first, want log_after", logs[0].ID)
+	}
+	if logs[1].ID != "log_before" {
+		t.Fatalf("request log order = %s second, want log_before", logs[1].ID)
+	}
+}
+
+func TestRuntimeConfigRepositoryLoadMissing(t *testing.T) {
+	store := openTestStore(t, 5)
+	config, found, err := NewRuntimeConfigRepository(store).Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if found {
+		t.Fatal("Load() found = true, want false")
+	}
+	if config != nil {
+		t.Fatalf("Load() config = %+v, want nil", config)
+	}
+}
+
+func TestRuntimeConfigRepositoryRoundTripAndOverwrite(t *testing.T) {
+	store := openTestStore(t, 5)
+	ctx := context.Background()
+	repo := NewRuntimeConfigRepository(store)
+
+	first := &domain.RuntimeConfig{
+		DefaultRateLimitRPM: 120,
+		DefaultRequestCost:  3,
+		MaintenanceMode:     true,
+		Routes: map[string]domain.RoutePolicy{
+			"GET /api/v1/users": {Enabled: true, Cost: 2, RateLimitRPM: 30},
+			"GET /api/v1/teams": {Enabled: false, Cost: 1, RateLimitRPM: 0},
+		},
+	}
+	if err := repo.Save(ctx, first); err != nil {
+		t.Fatalf("Save(first): %v", err)
+	}
+	loaded, found, err := repo.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load(first): %v", err)
+	}
+	if !found {
+		t.Fatal("Load(first) found = false, want true")
+	}
+	if !reflect.DeepEqual(loaded, first) {
+		t.Fatalf("Load(first) = %+v, want %+v", loaded, first)
+	}
+
+	second := &domain.RuntimeConfig{
+		DefaultRateLimitRPM: 60,
+		DefaultRequestCost:  1,
+		MaintenanceMode:     false,
+	}
+	if err := repo.Save(ctx, second); err != nil {
+		t.Fatalf("Save(second): %v", err)
+	}
+	loaded, found, err = repo.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load(second): %v", err)
+	}
+	if !found {
+		t.Fatal("Load(second) found = false, want true")
+	}
+	if !reflect.DeepEqual(loaded, second) {
+		t.Fatalf("Load(second) = %+v, want %+v", loaded, second)
+	}
+
+	if err := repo.Save(ctx, nil); err == nil {
+		t.Fatal("Save(nil) succeeded, want error")
+	}
+}
+
+func TestRuntimeConfigRepositoryPersistsAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "flow.db")
+	ctx := context.Background()
+
+	first, err := Open(ctx, path, 5)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	config := &domain.RuntimeConfig{
+		DefaultRateLimitRPM: 90,
+		DefaultRequestCost:  2,
+		MaintenanceMode:     true,
+		Routes: map[string]domain.RoutePolicy{
+			"POST /api/v1/teams": {Enabled: true, Cost: 4, RateLimitRPM: 15},
+		},
+	}
+	if err := NewRuntimeConfigRepository(first).Save(ctx, config); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	second, err := Open(ctx, path, 5)
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := second.Close(); err != nil {
+			t.Errorf("second Close: %v", err)
+		}
+	})
+	loaded, found, err := NewRuntimeConfigRepository(second).Load(ctx)
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if !found {
+		t.Fatal("Load() found = false, want true")
+	}
+	if !reflect.DeepEqual(loaded, config) {
+		t.Fatalf("Load() = %+v, want %+v", loaded, config)
+	}
+}
+
+func TestHealthReportsWALSizeAndThreshold(t *testing.T) {
+	store := openTestStore(t, 5)
+	ctx := context.Background()
+
+	if err := NewUserRepository(store).Create(ctx, mustUser(t, "WAL", "wal@example.com")); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	store.SetWALWarnBytes(1)
+	health, err := store.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health(): %v", err)
+	}
+	if health.WALBytes <= 1 {
+		t.Fatalf("WALBytes = %d, want > 1 after a write", health.WALBytes)
+	}
+	if health.WALWarnBytes != 1 {
+		t.Errorf("WALWarnBytes = %d, want 1", health.WALWarnBytes)
+	}
+	if health.WALHealthy {
+		t.Errorf("WALHealthy = true, WALBytes = %d, WALWarnBytes = %d", health.WALBytes, health.WALWarnBytes)
+	}
+	if health.OK {
+		t.Errorf("OK = true with a WAL over the threshold: %+v", health)
+	}
+
+	store.SetWALWarnBytes(0)
+	health, err = store.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health() with disabled threshold: %v", err)
+	}
+	if health.WALWarnBytes != 0 {
+		t.Errorf("WALWarnBytes = %d, want 0", health.WALWarnBytes)
+	}
+	if !health.WALHealthy {
+		t.Errorf("WALHealthy = false with the threshold disabled: %+v", health)
+	}
+	if !health.OK {
+		t.Errorf("OK = false with the threshold disabled: %+v", health)
+	}
+
+	store.SetWALWarnBytes(-1)
+	if got := store.walWarnBytes.Load(); got != 0 {
+		t.Errorf("WALWarnBytes after negative set = %d, want 0", got)
+	}
+}
+
+func TestFormatTimestampIsFixedWidthUTC(t *testing.T) {
+	base := time.Date(2026, time.November, 24, 6, 56, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		in   time.Time
+		want string
+	}{
+		{"zero nanoseconds", base, "2026-11-24T06:56:00.000000000Z"},
+		{"half second", base.Add(500 * time.Millisecond), "2026-11-24T06:56:00.500000000Z"},
+		{
+			"non-UTC offset",
+			base.Add(123456789 * time.Nanosecond).In(time.FixedZone("JST", 9*60*60)),
+			"2026-11-24T06:56:00.123456789Z",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatTimestamp(tc.in)
+			if got != tc.want {
+				t.Fatalf("formatTimestamp() = %q, want %q", got, tc.want)
+			}
+			if len(got) != 30 {
+				t.Fatalf("formatTimestamp() length = %d, want 30", len(got))
+			}
+			parsed, err := parseTimestamp("test", got)
+			if err != nil {
+				t.Fatalf("parseTimestamp(%q): %v", got, err)
+			}
+			if !parsed.Equal(tc.in) {
+				t.Fatalf("parsed = %s, want %s", parsed, tc.in)
+			}
+		})
 	}
 }

@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"strings"
+	"sync"
 
 	"github.com/aiagate/flow-app-template/internal/contract/port"
 	"github.com/aiagate/flow-app-template/internal/domain"
@@ -17,13 +18,24 @@ type RuntimeStats struct {
 
 // RuntimeUseCase owns the control-plane endpoints.
 type RuntimeUseCase struct {
-	guard port.HotPathGuard
-	queue port.WriteEventQueue
-	db    port.DBHealthChecker
+	guard      port.HotPathGuard
+	queue      port.WriteEventQueue
+	db         port.DBHealthChecker
+	configRepo port.RuntimeConfigRepository
+
+	// updateMu serializes the persist-then-swap critical section so two
+	// concurrent updates cannot commit to SQLite in one order and replace the
+	// hot-path snapshot in the reverse order.
+	updateMu sync.Mutex
 }
 
-func NewRuntimeUseCase(guard port.HotPathGuard, queue port.WriteEventQueue, db port.DBHealthChecker) *RuntimeUseCase {
-	return &RuntimeUseCase{guard: guard, queue: queue, db: db}
+func NewRuntimeUseCase(
+	guard port.HotPathGuard,
+	queue port.WriteEventQueue,
+	db port.DBHealthChecker,
+	configRepo port.RuntimeConfigRepository,
+) *RuntimeUseCase {
+	return &RuntimeUseCase{guard: guard, queue: queue, db: db, configRepo: configRepo}
 }
 
 // GetRuntimeConfig returns a defensive copy of the immutable hot-path snapshot.
@@ -42,9 +54,11 @@ type UpdateRuntimeConfigInput struct {
 	Routes              map[string]domain.RoutePolicy
 }
 
-// UpdateRuntimeConfig validates the candidate snapshot and atomically swaps it
-// into the hot path. Existing route names are replaced, not merged.
-func (r *RuntimeUseCase) UpdateRuntimeConfig(input UpdateRuntimeConfigInput) (*domain.RuntimeConfig, error) {
+// UpdateRuntimeConfig validates the candidate snapshot, persists it when a
+// repository is configured, and only then atomically swaps it into the hot
+// path. A failed save leaves the in-memory snapshot untouched so a restart
+// cannot silently roll back a configuration the operator never saw accepted.
+func (r *RuntimeUseCase) UpdateRuntimeConfig(ctx context.Context, input UpdateRuntimeConfigInput) (*domain.RuntimeConfig, error) {
 	if input.DefaultRateLimitRPM <= 0 {
 		return nil, validationError("default_rate_limit_rpm", "must be positive")
 	}
@@ -70,13 +84,26 @@ func (r *RuntimeUseCase) UpdateRuntimeConfig(input UpdateRuntimeConfigInput) (*d
 		routes[name] = policy
 	}
 
-	r.guard.UpdateConfig(&domain.RuntimeConfig{
+	next := &domain.RuntimeConfig{
 		DefaultRateLimitRPM: input.DefaultRateLimitRPM,
 		DefaultRequestCost:  input.DefaultRequestCost,
 		MaintenanceMode:     input.MaintenanceMode,
 		Routes:              routes,
-	})
-	return r.GetRuntimeConfig(), nil
+	}
+
+	// Hold the lock across persistence and the snapshot swap. Saving and
+	// swapping separately would let two accepted updates interleave: SQLite
+	// could keep update B while the hot path ends up with update A.
+	r.updateMu.Lock()
+	defer r.updateMu.Unlock()
+
+	if r.configRepo != nil {
+		if err := r.configRepo.Save(ctx, next); err != nil {
+			return nil, ClassifyError(err)
+		}
+	}
+	r.guard.UpdateConfig(next)
+	return next.Clone(), nil
 }
 
 // GetRuntimeStats reads every counter without touching the write path.

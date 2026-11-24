@@ -2,7 +2,7 @@
 Description=Litestream continuous replication for Flow API SQLite
 Documentation=https://litestream.io/
 After=network-online.target flow-api.service
-Wants=network-online.target
+Wants=network-online.target flow-api.service
 
 [Service]
 Type=simple
@@ -12,7 +12,7 @@ WorkingDirectory=/var/lib/flow-api
 StateDirectory=flow-api
 StateDirectoryMode=0750
 UMask=0027
-EnvironmentFile=/etc/flow-api/flow-api.env
+EnvironmentFile=/etc/flow-api/litestream.env
 ExecStart=/usr/local/bin/litestream replicate -config /etc/flow-api/litestream.yml
 Restart=always
 RestartSec=5

@@ -13,6 +13,9 @@ var (
 	ErrInsufficientBalance = errors.New("insufficient balance")
 	ErrRateLimited         = errors.New("rate limited")
 	ErrRouteDisabled       = errors.New("route disabled")
+	ErrUnauthorized        = errors.New("unauthorized")
+	ErrForbidden           = errors.New("forbidden")
+	ErrTooManyAccounts     = errors.New("too many accounts")
 )
 
 // ValidationError describes which value failed validation and why.

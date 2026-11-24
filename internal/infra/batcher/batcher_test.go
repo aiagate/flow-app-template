@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +14,10 @@ import (
 	"github.com/aiagate/flow-app-template/internal/contract/port"
 	"github.com/aiagate/flow-app-template/internal/domain"
 )
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
 
 // fakeSink is a thread-safe port.BatchSink that records every committed batch.
 type fakeSink struct {
@@ -466,5 +472,318 @@ func TestQueueFullCounterDoesNotBlockEnqueue(t *testing.T) {
 	}
 	if got := b.Stats().Dropped; got != 1 {
 		t.Fatalf("Dropped = %d, want 1", got)
+	}
+}
+
+// flakySink fails the next N WriteBatch calls, then records payloads.
+type flakySink struct {
+	failures atomic.Int64
+	attempts atomic.Int64
+
+	mu       sync.Mutex
+	payloads []port.BatchPayload
+}
+
+func (s *flakySink) WriteBatch(_ context.Context, payload port.BatchPayload) error {
+	s.attempts.Add(1)
+	if s.failures.Add(-1) >= 0 {
+		return errors.New("sink unavailable")
+	}
+	s.mu.Lock()
+	s.payloads = append(s.payloads, payload)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *flakySink) billingCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total := 0
+	for _, payload := range s.payloads {
+		total += len(payload.BillingEvents)
+	}
+	return total
+}
+
+func testBillingEvent(index int) domain.BillingEvent {
+	return domain.BillingEvent{
+		ID:         domain.NewEventID(),
+		AccountID:  "acct",
+		Amount:     -1,
+		Reason:     "request",
+		RequestID:  fmt.Sprintf("req_%d", index),
+		OccurredAt: time.Now(),
+	}
+}
+
+func TestEnqueueBillingWithQuotaCommitsBothTogether(t *testing.T) {
+	sink := &fakeSink{}
+	b, err := New(sink, Options{BatchSize: 2, FlushInterval: 5 * time.Second, Logger: discardLogger()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() {
+		if err := b.Drain(context.Background()); err != nil {
+			t.Errorf("Drain: %v", err)
+		}
+	}()
+
+	event := domain.BillingEvent{
+		ID:         domain.NewEventID(),
+		AccountID:  "acct",
+		Amount:     10,
+		Reason:     "credit",
+		RequestID:  "req_1",
+		OccurredAt: time.Now(),
+	}
+	if err := b.EnqueueBillingWithQuota(event, domain.AccountQuota{AccountID: "acct", Balance: 10, RateLimitRPM: 60}); err != nil {
+		t.Fatalf("EnqueueBillingWithQuota: %v", err)
+	}
+	// One queue slot holds both values.
+	if stats := b.Stats(); stats.Enqueued != 1 {
+		t.Fatalf("Enqueued = %d after one combined enqueue, want 1", stats.Enqueued)
+	}
+
+	// A later quota for the same account replaces the embedded snapshot while
+	// the billing event is preserved.
+	if err := b.EnqueueQuotaSync(domain.AccountQuota{AccountID: "acct", Balance: 4, RateLimitRPM: 30}); err != nil {
+		t.Fatalf("EnqueueQuotaSync: %v", err)
+	}
+
+	waitFor(t, 2*time.Second, func() bool { return sink.commitCount() == 1 })
+	payloads := sink.payloadSnapshot()
+	if len(payloads) != 1 {
+		t.Fatalf("commits = %d, want 1", len(payloads))
+	}
+	payload := payloads[0]
+	if len(payload.BillingEvents) != 1 || payload.BillingEvents[0].ID != event.ID {
+		t.Fatalf("billing events = %+v, want the combined event", payload.BillingEvents)
+	}
+	if len(payload.Quotas) != 1 {
+		t.Fatalf("quotas = %+v, want a single deduplicated quota", payload.Quotas)
+	}
+	if got := payload.Quotas[0]; got.AccountID != "acct" || got.Balance != 4 || got.RateLimitRPM != 30 {
+		t.Fatalf("quota = %+v, want latest snapshot 4/30", got)
+	}
+}
+
+func TestEnqueueQuotaSyncBlockingWaitsForSpace(t *testing.T) {
+	sink := &blockingSink{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	b, err := New(sink, Options{
+		QueueCapacity: 1,
+		BatchSize:     1,
+		FlushInterval: time.Hour,
+		Logger:        discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(sink.release) }) }
+	defer func() {
+		release()
+		if err := b.Drain(context.Background()); err != nil {
+			t.Errorf("Drain: %v", err)
+		}
+	}()
+
+	if err := b.EnqueueBilling(testBillingEvent(0)); err != nil {
+		t.Fatalf("first enqueue: %v", err)
+	}
+	select {
+	case <-sink.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer did not enter WriteBatch")
+	}
+	// The writer is blocked and the single channel slot is taken.
+	if err := b.EnqueueBilling(testBillingEvent(1)); err != nil {
+		t.Fatalf("second enqueue: %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- b.EnqueueQuotaSyncBlocking(context.Background(), domain.AccountQuota{AccountID: "acct", Balance: 5})
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("blocking enqueue returned while full: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	release()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("blocking enqueue: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocking enqueue did not complete after space freed")
+	}
+}
+
+func TestEnqueueQuotaSyncBlockingHonorsCancellation(t *testing.T) {
+	sink := &blockingSink{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	b, err := New(sink, Options{
+		QueueCapacity: 1,
+		BatchSize:     1,
+		FlushInterval: time.Hour,
+		Logger:        discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(sink.release) }) }
+	defer func() {
+		release()
+		if err := b.Drain(context.Background()); err != nil {
+			t.Errorf("Drain: %v", err)
+		}
+	}()
+
+	if err := b.EnqueueBilling(testBillingEvent(0)); err != nil {
+		t.Fatalf("first enqueue: %v", err)
+	}
+	select {
+	case <-sink.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer did not enter WriteBatch")
+	}
+	if err := b.EnqueueBilling(testBillingEvent(1)); err != nil {
+		t.Fatalf("second enqueue: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- b.EnqueueQuotaSyncBlocking(ctx, domain.AccountQuota{AccountID: "acct", Balance: 5})
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("blocking enqueue error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocking enqueue ignored cancellation")
+	}
+}
+
+func TestEnqueueQuotaSyncBlockingAfterDrain(t *testing.T) {
+	b, err := New(&fakeSink{}, Options{Logger: discardLogger()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := b.Drain(context.Background()); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if err := b.EnqueueQuotaSyncBlocking(context.Background(), domain.AccountQuota{AccountID: "acct"}); !errors.Is(err, port.ErrQueueClosed) {
+		t.Fatalf("blocking enqueue after Drain error = %v, want ErrQueueClosed", err)
+	}
+}
+
+func TestFailingSinkRetriesWithExponentialBackoffAndRecovers(t *testing.T) {
+	const (
+		total     = 40
+		batchSize = 8
+	)
+	sink := &flakySink{}
+	sink.failures.Store(3)
+	b, err := New(sink, Options{
+		QueueCapacity:   128,
+		BatchSize:       batchSize,
+		FlushInterval:   5 * time.Millisecond,
+		MaxRetryBackoff: 20 * time.Millisecond,
+		Logger:          discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() {
+		if err := b.Drain(context.Background()); err != nil {
+			t.Errorf("Drain: %v", err)
+		}
+	}()
+
+	for i := 0; i < total; i++ {
+		if err := b.EnqueueBilling(testBillingEvent(i)); err != nil {
+			t.Fatalf("EnqueueBilling %d: %v", i, err)
+		}
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	var stats domain.BatcherStats
+	for time.Now().Before(deadline) {
+		stats = b.Stats()
+		// While retrying, the writer must not pull more events into pending.
+		if stats.Pending > batchSize {
+			t.Fatalf("Pending = %d while retrying, want <= %d", stats.Pending, batchSize)
+		}
+		if stats.Written == total {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	stats = b.Stats()
+	if stats.Written != total {
+		t.Fatalf("Written = %d, want %d; stats = %+v", stats.Written, total, stats)
+	}
+	if stats.Errors == 0 {
+		t.Fatalf("Errors = 0, want the failed attempts counted")
+	}
+	if stats.Pending != 0 {
+		t.Fatalf("Pending after recovery = %d, want 0", stats.Pending)
+	}
+	if got := sink.billingCount(); got != total {
+		t.Fatalf("persisted billing events = %d, want %d", got, total)
+	}
+}
+
+func TestDrainWakesDuringRetryBackoff(t *testing.T) {
+	const batchSize = 4
+	sink := &flakySink{}
+	sink.failures.Store(1_000)
+	b, err := New(sink, Options{
+		QueueCapacity:   16,
+		BatchSize:       batchSize,
+		FlushInterval:   5 * time.Millisecond,
+		MaxRetryBackoff: time.Hour,
+		Logger:          discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for i := 0; i < batchSize; i++ {
+		if err := b.EnqueueBilling(testBillingEvent(i)); err != nil {
+			t.Fatalf("EnqueueBilling %d: %v", i, err)
+		}
+	}
+	waitFor(t, 2*time.Second, func() bool { return b.Stats().Errors > 0 })
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- b.Drain(context.Background()) }()
+
+	select {
+	case err := <-done:
+		// The sink never recovers, so the drain reports the joined commit
+		// failures instead of blocking on the long retry timer.
+		if err == nil {
+			t.Fatal("Drain error = nil, want the persistent sink failure")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Drain did not wake the writer during retry backoff")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Drain took %s, want it to wake immediately", elapsed)
+	}
+
+	stats := b.Stats()
+	if stats.Errors == 0 || stats.Pending != 0 {
+		t.Fatalf("Stats() = %+v, want errors > 0 and pending 0", stats)
 	}
 }

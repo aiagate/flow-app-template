@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,9 +32,54 @@ type e2eClient struct {
 	t      *testing.T
 	base   string
 	client *http.Client
+	token  string
 
 	apiRequests   atomic.Int64
 	billingEvents atomic.Int64
+}
+
+// baseTestConfig returns a valid end-to-end configuration using a fresh
+// temporary database per test.
+func baseTestConfig(t *testing.T) config.Config {
+	t.Helper()
+	return config.Config{
+		HTTPAddr:              "127.0.0.1:0",
+		DBPath:                filepath.Join(t.TempDir(), "flow.db"),
+		DBReadConns:           5,
+		DefaultInitialBalance: 0,
+		DefaultRateLimitRPM:   1000,
+		DefaultRequestCost:    1,
+		ShutdownTimeout:       5 * time.Second,
+		AdminAPIKey:           "admin-secret",
+		AccountAPIKeys:        nil,
+		DrainTimeout:          5 * time.Second,
+		WALWarnBytes:          64 << 20,
+		MaxAccounts:           4096,
+	}
+}
+
+func newE2EClient(t *testing.T, app *App, token string) *e2eClient {
+	t.Helper()
+	return &e2eClient{
+		t:    t,
+		base: "http://" + app.Addr(),
+		// Keep-alive is disabled so the short-lived test never leaves a
+		// just-dialed idle connection racing http.Server.Shutdown.
+		client: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}},
+		token:  token,
+	}
+}
+
+func shutdownTestApp(t *testing.T, app *App) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := app.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if err := app.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
 }
 
 func (c *e2eClient) do(method, path string, body any, account, requestID string) (*apiResponse, error) {
@@ -56,6 +103,9 @@ func (c *e2eClient) do(method, path string, body any, account, requestID string)
 		request.Header.Set("Content-Type", "application/json")
 	}
 	request.Header.Set("Accept", "application/json")
+	if c.token != "" {
+		request.Header.Set("Authorization", "Bearer "+c.token)
+	}
 	if account != "" {
 		request.Header.Set("X-Account-ID", account)
 	}
@@ -162,15 +212,7 @@ func text(t *testing.T, object map[string]any, key string) string {
 }
 
 func TestEndToEndGracefulShutdownAndPersistence(t *testing.T) {
-	cfg := config.Config{
-		HTTPAddr:              "127.0.0.1:0",
-		DBPath:                filepath.Join(t.TempDir(), "flow.db"),
-		DBReadConns:           5,
-		DefaultInitialBalance: 0,
-		DefaultRateLimitRPM:   1000,
-		DefaultRequestCost:    1,
-		ShutdownTimeout:       5 * time.Second,
-	}
+	cfg := baseTestConfig(t)
 
 	app, err := newApp(context.Background(), cfg)
 	if err != nil {
@@ -180,13 +222,7 @@ func TestEndToEndGracefulShutdownAndPersistence(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	client := &e2eClient{
-		t:    t,
-		base: "http://" + app.Addr(),
-		// Keep-alive is disabled so the short-lived test never leaves a
-		// just-dialed idle connection racing http.Server.Shutdown.
-		client: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}},
-	}
+	client := newE2EClient(t, app, cfg.AdminAPIKey)
 
 	// Health and embedded console.
 	health := client.mustStatus(http.MethodGet, "/healthz", nil, "", http.StatusOK)
@@ -519,5 +555,208 @@ func TestEndToEndGracefulShutdownAndPersistence(t *testing.T) {
 		if state.Balance != finalBalances[accountID] {
 			t.Fatalf("hydrated balance for %q = %d, want %d", accountID, state.Balance, finalBalances[accountID])
 		}
+	}
+}
+
+func TestEndToEndAuthenticationAndAuthorization(t *testing.T) {
+	cfg := baseTestConfig(t)
+	cfg.AdminAPIKey = "admin-secret"
+	cfg.AccountAPIKeys = map[string]string{"acct-a": "acct-a-secret"}
+	cfg.DefaultInitialBalance = 1000
+
+	app, err := newApp(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	if err := app.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer shutdownTestApp(t, app)
+
+	anonymous := newE2EClient(t, app, "")
+	account := newE2EClient(t, app, cfg.AccountAPIKeys["acct-a"])
+	admin := newE2EClient(t, app, cfg.AdminAPIKey)
+
+	// Every /api route requires a bearer token, while the console and the
+	// probe stay public.
+	anonymous.mustError(http.MethodGet, "/api/v1/users", nil, "", "UNAUTHORIZED", http.StatusUnauthorized)
+	anonymous.mustStatus(http.MethodGet, "/", nil, "", http.StatusOK)
+	anonymous.mustStatus(http.MethodGet, "/healthz", nil, "", http.StatusOK)
+
+	// An account principal is pinned to its own account and cannot touch the
+	// control plane or the unmetered funding route.
+	account.mustError(http.MethodGet, "/api/v1/runtime/config", nil, "", "FORBIDDEN", http.StatusForbidden)
+	account.mustError(http.MethodPost, "/api/v1/accounts/default/credit", map[string]any{
+		"amount": 10, "reason": "forbidden",
+	}, "", "FORBIDDEN", http.StatusForbidden)
+	account.mustStatus(http.MethodGet, "/api/v1/accounts/acct-a", nil, "", http.StatusOK)
+	account.mustStatus(http.MethodPost, "/api/v1/accounts/acct-a/charge", map[string]any{
+		"amount": 10, "reason": "usage",
+	}, "", http.StatusOK)
+	account.mustStatus(http.MethodGet, "/api/v1/users", nil, "", http.StatusOK)
+
+	// The admin key reaches every route, including account-scoped ledger
+	// operations.
+	admin.mustStatus(http.MethodGet, "/api/v1/runtime/config", nil, "", http.StatusOK)
+	admin.mustStatus(http.MethodGet, "/api/v1/runtime/stats", nil, "", http.StatusOK)
+	admin.mustStatus(http.MethodGet, "/api/v1/logs", nil, "", http.StatusOK)
+	admin.mustStatus(http.MethodGet, "/api/v1/accounts/acct-a", nil, "", http.StatusOK)
+	admin.mustStatus(http.MethodPost, "/api/v1/accounts/acct-a/credit", map[string]any{
+		"amount": 25, "reason": "top-up",
+	}, "", http.StatusOK)
+	admin.mustStatus(http.MethodPost, "/api/v1/accounts/acct-a/charge", map[string]any{
+		"amount": 5, "reason": "usage",
+	}, "", http.StatusOK)
+	admin.mustStatus(http.MethodGet, "/api/v1/users", nil, "", http.StatusOK)
+}
+
+func TestRuntimeConfigPersistsAcrossServerRestart(t *testing.T) {
+	cfg := baseTestConfig(t)
+	cfg.AdminAPIKey = "admin-secret"
+	cfg.AccountAPIKeys = map[string]string{"acct-a": "acct-a-secret"}
+
+	first, err := newApp(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("newApp first: %v", err)
+	}
+	if err := first.Start(); err != nil {
+		t.Fatalf("Start first: %v", err)
+	}
+
+	client := newE2EClient(t, first, cfg.AdminAPIKey)
+	client.mustStatus(http.MethodPut, "/api/v1/runtime/config", map[string]any{
+		"default_rate_limit_rpm": 250,
+		"default_request_cost":   3,
+		"maintenance_mode":       true,
+		"routes": map[string]any{
+			"GET /api/v1/users": map[string]any{"enabled": false, "cost": 7, "rate_limit_rpm": 11},
+		},
+	}, "", http.StatusOK)
+	want := client.mustStatus(http.MethodGet, "/api/v1/runtime/config", nil, "", http.StatusOK)
+	shutdownTestApp(t, first)
+
+	second, err := newApp(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("newApp second: %v", err)
+	}
+	if err := second.Start(); err != nil {
+		t.Fatalf("Start second: %v", err)
+	}
+	defer shutdownTestApp(t, second)
+
+	restarted := newE2EClient(t, second, cfg.AdminAPIKey)
+	got := restarted.mustStatus(http.MethodGet, "/api/v1/runtime/config", nil, "", http.StatusOK)
+	if !reflect.DeepEqual(want.Body, got.Body) {
+		t.Fatalf("persisted runtime config changed across restart:\nwant = %#v\ngot  = %#v", want.Body, got.Body)
+	}
+	if got.Body["maintenance_mode"] != true {
+		t.Fatalf("maintenance_mode = %v, want true", got.Body["maintenance_mode"])
+	}
+	routes := object(t, got.Body, "routes")
+	policy := object(t, routes, "GET /api/v1/users")
+	if policy["enabled"] != false || policy["cost"] != float64(7) || policy["rate_limit_rpm"] != float64(11) {
+		t.Fatalf("persisted route policy = %#v", policy)
+	}
+}
+
+func TestHealthzReturns503WhenWALExceedsWarnThreshold(t *testing.T) {
+	cfg := baseTestConfig(t)
+	cfg.WALWarnBytes = 1
+
+	app, err := newApp(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	if err := app.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer shutdownTestApp(t, app)
+
+	client := newE2EClient(t, app, cfg.AdminAPIKey)
+	client.mustStatus(http.MethodPost, "/api/v1/accounts/wal/credit", map[string]any{
+		"amount": 100, "reason": "grow-wal",
+	}, "", http.StatusOK)
+
+	// Wait until the batcher has committed at least one write so the WAL file
+	// has grown from the configured threshold.
+	deadline := time.Now().Add(5 * time.Second)
+	for app.writer.Stats().Written == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("batcher did not commit a write")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	health := client.mustStatus(http.MethodGet, "/healthz", nil, "", http.StatusServiceUnavailable)
+	if health.Body["status"] != "degraded" {
+		t.Fatalf("health status = %v, want degraded", health.Body["status"])
+	}
+	db := object(t, health.Body, "db")
+	walBytes, _ := db["wal_bytes"].(float64)
+	warnBytes, _ := db["wal_warn_bytes"].(float64)
+	if warnBytes != 1 {
+		t.Fatalf("wal_warn_bytes = %v, want 1", db["wal_warn_bytes"])
+	}
+	if walBytes <= warnBytes {
+		t.Fatalf("wal_bytes = %v, want greater than wal_warn_bytes %v", walBytes, warnBytes)
+	}
+	if db["wal_healthy"] != false {
+		t.Fatalf("wal_healthy = %v, want false", db["wal_healthy"])
+	}
+}
+
+func TestShutdownWithTimeoutsPersistsFinalSnapshotWithIndependentBudgets(t *testing.T) {
+	cfg := baseTestConfig(t)
+
+	app, err := newApp(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	if err := app.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Mutate only the hot path so the final SnapshotQuotas is the sole writer
+	// of this balance.
+	if err := app.hot.Credit("final", 777); err != nil {
+		t.Fatalf("seed hot path: %v", err)
+	}
+
+	httpCtx, cancelHTTP := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelHTTP()
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelDrain()
+
+	// An expired HTTP budget may surface a context error, but the valid drain
+	// budget must still persist the final snapshot.
+	if err := app.ShutdownWithTimeouts(httpCtx, drainCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ShutdownWithTimeouts: %v", err)
+	}
+	if err := app.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	stats := app.writer.Stats()
+	if stats.Dropped != 0 {
+		t.Fatalf("batcher dropped %d events", stats.Dropped)
+	}
+	if stats.Enqueued != stats.Written {
+		t.Fatalf("batcher enqueued %d events but wrote %d", stats.Enqueued, stats.Written)
+	}
+
+	reopened, err := sqlite.Open(context.Background(), cfg.DBPath, cfg.DBReadConns)
+	if err != nil {
+		t.Fatalf("reopen sqlite: %v", err)
+	}
+	defer reopened.Close()
+
+	var balance int64
+	if err := reopened.ReadDB.QueryRow(
+		`SELECT balance FROM account_quotas WHERE account_id = ?`, "final",
+	).Scan(&balance); err != nil {
+		t.Fatalf("load final quota: %v", err)
+	}
+	if balance != 777 {
+		t.Fatalf("persisted final balance = %d, want 777", balance)
 	}
 }

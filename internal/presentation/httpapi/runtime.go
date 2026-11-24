@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/aiagate/flow-app-template/internal/domain"
 	"github.com/aiagate/flow-app-template/internal/usecase"
@@ -75,6 +76,7 @@ func (p *routesPayload) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		p.policies = make(map[string]domain.RoutePolicy, len(raw))
+		seen := make(map[string]struct{}, len(raw))
 		for _, entry := range raw {
 			name := entry.Route
 			if name == "" {
@@ -83,6 +85,11 @@ func (p *routesPayload) UnmarshalJSON(data []byte) error {
 			if name == "" {
 				name = entry.Path
 			}
+			name = strings.TrimSpace(name)
+			if _, exists := seen[name]; exists {
+				return fmt.Errorf("routes must not contain duplicate names")
+			}
+			seen[name] = struct{}{}
 			p.policies[name] = domain.RoutePolicy{
 				Enabled:      entry.Enabled,
 				Cost:         entry.Cost,
@@ -114,6 +121,8 @@ type batcherStatsResponse struct {
 	Enqueued      int64 `json:"enqueued"`
 	Written       int64 `json:"written"`
 	Dropped       int64 `json:"dropped"`
+	Pending       int   `json:"pending"`
+	Errors        int64 `json:"errors"`
 	QueueDepth    int   `json:"queue_depth"`
 	QueueCapacity int   `json:"queue_capacity"`
 	FlushCommits  int64 `json:"flush_commits"`
@@ -126,17 +135,17 @@ func (h *Handler) getRuntimeConfig(w http.ResponseWriter, _ *http.Request) {
 func (h *Handler) updateRuntimeConfig(w http.ResponseWriter, r *http.Request) {
 	var request runtimeConfigRequest
 	if err := decodeJSON(r, &request); err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
-	config, err := h.deps.Runtime.UpdateRuntimeConfig(usecase.UpdateRuntimeConfigInput{
+	config, err := h.deps.Runtime.UpdateRuntimeConfig(r.Context(), usecase.UpdateRuntimeConfigInput{
 		DefaultRateLimitRPM: request.DefaultRateLimitRPM,
 		DefaultRequestCost:  request.DefaultRequestCost,
 		MaintenanceMode:     request.MaintenanceMode,
 		Routes:              request.Routes.policies,
 	})
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, newRuntimeConfigResponse(config))
@@ -145,7 +154,7 @@ func (h *Handler) updateRuntimeConfig(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) getRuntimeStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := h.deps.Runtime.GetRuntimeStats(r.Context())
 	if err != nil {
-		writeError(w, err)
+		h.writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, runtimeStatsResponse{
@@ -161,6 +170,8 @@ func (h *Handler) getRuntimeStats(w http.ResponseWriter, r *http.Request) {
 			Enqueued:      stats.Batcher.Enqueued,
 			Written:       stats.Batcher.Written,
 			Dropped:       stats.Batcher.Dropped,
+			Pending:       stats.Batcher.Pending,
+			Errors:        stats.Batcher.Errors,
 			QueueDepth:    stats.Batcher.QueueDepth,
 			QueueCapacity: stats.Batcher.QueueCapacity,
 			FlushCommits:  stats.Batcher.FlushCommits,

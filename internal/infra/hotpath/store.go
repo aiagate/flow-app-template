@@ -4,6 +4,8 @@
 package hotpath
 
 import (
+	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,8 +14,13 @@ import (
 	"github.com/aiagate/flow-app-template/internal/domain"
 )
 
-// rateLimitWindow is the fixed admission window per account.
-const rateLimitWindow = time.Minute
+const (
+	// rateLimitWindow is the fixed admission window per account.
+	rateLimitWindow = time.Minute
+	// defaultMaxAccounts bounds the number of lazily created accounts so an
+	// unbounded stream of unknown IDs cannot exhaust memory.
+	defaultMaxAccounts = 4096
+)
 
 // Options configures a Store. Zero values are valid: an unknown account starts
 // with a zero balance and an unlimited rate limit until Hydrate or UpdateConfig
@@ -21,6 +28,9 @@ const rateLimitWindow = time.Minute
 type Options struct {
 	InitialBalance      int64
 	DefaultRateLimitRPM int
+	// MaxAccounts bounds lazily created accounts. Values <= 0 use
+	// defaultMaxAccounts.
+	MaxAccounts int
 	// Clock is injectable for deterministic window tests. Nil means time.Now.
 	Clock func() time.Time
 }
@@ -51,6 +61,7 @@ type Store struct {
 
 	initialBalance      int64
 	defaultRateLimitRPM int
+	maxAccounts         int
 	clock               func() time.Time
 
 	totalRequests       atomic.Int64
@@ -73,10 +84,15 @@ func New(opts Options) *Store {
 	if clock == nil {
 		clock = time.Now
 	}
+	maxAccounts := opts.MaxAccounts
+	if maxAccounts <= 0 {
+		maxAccounts = defaultMaxAccounts
+	}
 	store := &Store{
 		accounts:            make(map[string]*accountBucket),
 		initialBalance:      opts.InitialBalance,
 		defaultRateLimitRPM: opts.DefaultRateLimitRPM,
+		maxAccounts:         maxAccounts,
 		clock:               clock,
 	}
 	store.config.Store(&domain.RuntimeConfig{DefaultRateLimitRPM: opts.DefaultRateLimitRPM})
@@ -99,20 +115,22 @@ func (s *Store) UpdateConfig(config *domain.RuntimeConfig) {
 }
 
 // Hydrate loads persisted quotas at startup. A later Hydrate replaces the
-// balance and rate limit and resets that account's current window. Empty
-// account IDs are ignored.
+// balance and rate limit and resets that account's current window. Invalid
+// account IDs are skipped. Hydration never drops a persisted account: when the
+// persisted set exceeds MaxAccounts, the limit grows to fit it.
 func (s *Store) Hydrate(quotas []domain.AccountQuota) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for _, quota := range quotas {
-		if quota.AccountID == "" {
+		accountID, err := domain.ValidateAccountID(quota.AccountID)
+		if err != nil {
 			continue
 		}
-		bucket := s.accounts[quota.AccountID]
+		bucket := s.accounts[accountID]
 		if bucket == nil {
 			bucket = &accountBucket{}
-			s.accounts[quota.AccountID] = bucket
+			s.accounts[accountID] = bucket
 		}
 		bucket.mu.Lock()
 		bucket.balance = quota.Balance
@@ -121,6 +139,9 @@ func (s *Store) Hydrate(quotas []domain.AccountQuota) {
 		bucket.windowStart = time.Time{}
 		bucket.windowCount = 0
 		bucket.mu.Unlock()
+	}
+	if len(s.accounts) > s.maxAccounts {
+		s.maxAccounts = len(s.accounts)
 	}
 }
 
@@ -167,7 +188,10 @@ func (s *Store) AcquireAndDebit(accountID, route string) (domain.HotPathDecision
 		cost = 0
 	}
 
-	bucket := s.bucketFor(accountID)
+	bucket, err := s.bucketFor(accountID)
+	if err != nil {
+		return rejected(err, cost, 0, 0), err
+	}
 	bucket.mu.Lock()
 	defer bucket.mu.Unlock()
 
@@ -181,6 +205,7 @@ func (s *Store) AcquireAndDebit(accountID, route string) (domain.HotPathDecision
 			Cost:             cost,
 			RemainingBalance: bucket.balance,
 			RemainingTokens:  0,
+			RateLimitRPM:     decisionRPM(rpm),
 		}, domain.ErrRateLimited
 	}
 
@@ -192,6 +217,7 @@ func (s *Store) AcquireAndDebit(accountID, route string) (domain.HotPathDecision
 			Cost:             cost,
 			RemainingBalance: bucket.balance,
 			RemainingTokens:  remaining,
+			RateLimitRPM:     decisionRPM(rpm),
 		}, domain.ErrInsufficientBalance
 	}
 
@@ -204,6 +230,7 @@ func (s *Store) AcquireAndDebit(accountID, route string) (domain.HotPathDecision
 		Cost:             cost,
 		RemainingBalance: bucket.balance,
 		RemainingTokens:  remaining,
+		RateLimitRPM:     decisionRPM(rpm),
 	}, nil
 }
 
@@ -233,7 +260,10 @@ func (s *Store) Authorize(accountID, route string) (domain.HotPathDecision, erro
 		return rejected(domain.ErrRouteDisabled, 0, 0, 0), domain.ErrRouteDisabled
 	}
 
-	bucket := s.bucketFor(accountID)
+	bucket, err := s.bucketFor(accountID)
+	if err != nil {
+		return rejected(err, 0, 0, 0), err
+	}
 	bucket.mu.Lock()
 	defer bucket.mu.Unlock()
 
@@ -246,6 +276,7 @@ func (s *Store) Authorize(accountID, route string) (domain.HotPathDecision, erro
 			Reason:           domain.ErrRateLimited.Error(),
 			RemainingBalance: bucket.balance,
 			RemainingTokens:  0,
+			RateLimitRPM:     decisionRPM(rpm),
 		}, domain.ErrRateLimited
 	}
 
@@ -254,17 +285,27 @@ func (s *Store) Authorize(accountID, route string) (domain.HotPathDecision, erro
 		Allowed:          true,
 		RemainingBalance: bucket.balance,
 		RemainingTokens:  remaining,
+		RateLimitRPM:     decisionRPM(rpm),
 	}, nil
 }
 
 // Debit deducts an explicit amount from an account without applying route
 // policy or the rate limit. Authorization is expected to have happened first.
+// It refuses unknown accounts instead of creating one with a free initial
+// balance.
 func (s *Store) Debit(accountID string, amount int64) (domain.HotPathDecision, error) {
+	accountID, err := domain.ValidateAccountID(accountID)
+	if err != nil {
+		return domain.HotPathDecision{}, err
+	}
 	if amount < 0 {
 		amount = 0
 	}
 
-	bucket := s.bucketFor(accountID)
+	bucket := s.findBucket(accountID)
+	if bucket == nil {
+		return domain.HotPathDecision{}, port.ErrNotFound
+	}
 	bucket.mu.Lock()
 	defer bucket.mu.Unlock()
 
@@ -290,28 +331,86 @@ func (s *Store) Debit(accountID string, amount int64) (domain.HotPathDecision, e
 }
 
 // Refund returns a previously charged amount to an account. Non-positive
-// amounts are ignored.
+// amounts and unknown accounts are ignored.
 func (s *Store) Refund(accountID string, amount int64) {
 	if amount <= 0 {
 		return
 	}
-	bucket := s.bucketFor(accountID)
+	accountID, err := domain.ValidateAccountID(accountID)
+	if err != nil {
+		return
+	}
+	bucket := s.findBucket(accountID)
+	if bucket == nil {
+		return
+	}
 	bucket.mu.Lock()
 	bucket.balance += amount
 	bucket.mu.Unlock()
 	s.totalRefunded.Add(amount)
 }
 
-// Credit adds funds to an account. Non-positive amounts are ignored.
-func (s *Store) Credit(accountID string, amount int64) {
-	if amount <= 0 {
-		return
+// Credit adds funds to an account. Non-positive amounts are ignored. An
+// unknown account is created with exactly the credited amount; it does not
+// inherit the configured initial balance because that balance is reserved for
+// accounts admitted through the request path.
+func (s *Store) Credit(accountID string, amount int64) error {
+	accountID, err := domain.ValidateAccountID(accountID)
+	if err != nil {
+		return err
 	}
-	bucket := s.bucketFor(accountID)
+	if amount <= 0 {
+		return nil
+	}
+
+	s.mu.Lock()
+	bucket := s.accounts[accountID]
+	if bucket == nil {
+		if len(s.accounts) >= s.maxAccounts {
+			s.mu.Unlock()
+			return domain.ErrTooManyAccounts
+		}
+		bucket = &accountBucket{
+			balance:      amount,
+			rateLimitRPM: s.defaultRateLimitRPM,
+		}
+		s.accounts[accountID] = bucket
+		s.mu.Unlock()
+		s.totalCredited.Add(amount)
+		return nil
+	}
+	s.mu.Unlock()
+
 	bucket.mu.Lock()
+	if bucket.balance > math.MaxInt64-amount {
+		bucket.mu.Unlock()
+		return fmt.Errorf("%w: balance overflow", domain.ErrValidation)
+	}
 	bucket.balance += amount
 	bucket.mu.Unlock()
 	s.totalCredited.Add(amount)
+	return nil
+}
+
+// RollbackCredit reverses a Credit when the corresponding persistence
+// operation fails. It never creates an account. The amount is always removed,
+// even when concurrent spending has already reduced the balance below it.
+func (s *Store) RollbackCredit(accountID string, amount int64) {
+	if amount <= 0 {
+		return
+	}
+	accountID, err := domain.ValidateAccountID(accountID)
+	if err != nil {
+		return
+	}
+	bucket := s.findBucket(accountID)
+	if bucket == nil {
+		return
+	}
+	bucket.mu.Lock()
+	bucket.balance -= amount
+	bucket.mu.Unlock()
+	s.totalCredited.Add(-amount)
 }
 
 // GetAccountState reports the in-memory state of a known account. It never
@@ -387,25 +486,53 @@ func (s *Store) Stats() domain.HotPathStats {
 	}
 }
 
-func (s *Store) bucketFor(accountID string) *accountBucket {
+// bucketFor returns the bucket for a valid account, creating it lazily with the
+// store defaults when capacity allows. Invalid IDs and a full account table are
+// reported to the caller instead of failing inside the hot path.
+func (s *Store) bucketFor(accountID string) (*accountBucket, error) {
+	accountID, err := domain.ValidateAccountID(accountID)
+	if err != nil {
+		return nil, err
+	}
+
 	s.mu.RLock()
 	bucket := s.accounts[accountID]
 	s.mu.RUnlock()
 	if bucket != nil {
-		return bucket
+		return bucket, nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if bucket = s.accounts[accountID]; bucket != nil {
-		return bucket
+		return bucket, nil
+	}
+	if len(s.accounts) >= s.maxAccounts {
+		return nil, domain.ErrTooManyAccounts
 	}
 	bucket = &accountBucket{
 		balance:      s.initialBalance,
 		rateLimitRPM: s.defaultRateLimitRPM,
 	}
 	s.accounts[accountID] = bucket
+	return bucket, nil
+}
+
+// findBucket returns an existing bucket without creating one.
+func (s *Store) findBucket(accountID string) *accountBucket {
+	s.mu.RLock()
+	bucket := s.accounts[accountID]
+	s.mu.RUnlock()
 	return bucket
+}
+
+// decisionRPM normalizes the effective limit for HotPathDecision, where zero
+// means unlimited.
+func decisionRPM(rpm int) int {
+	if rpm < 0 {
+		return 0
+	}
+	return rpm
 }
 
 func effectiveRPM(

@@ -83,6 +83,9 @@ type HotPathDecision struct {
 	Cost             int64
 	RemainingBalance int64
 	RemainingTokens  int64
+	// RateLimitRPM is the effective requests-per-minute limit enforced for the
+	// request. Zero means unlimited.
+	RateLimitRPM int
 }
 
 // HotPathStats is a snapshot of hot-path counters.
@@ -100,6 +103,8 @@ type BatcherStats struct {
 	Enqueued      int64
 	Written       int64
 	Dropped       int64
+	Pending       int
+	Errors        int64
 	QueueDepth    int
 	QueueCapacity int
 	FlushCommits  int64
@@ -110,6 +115,9 @@ type DBHealth struct {
 	OK                bool
 	JournalMode       string
 	WALAutocheckpoint int64
+	WALBytes          int64
+	WALWarnBytes      int64
+	WALHealthy        bool
 	ReadQueryOnly     bool
 	ReadConnections   int
 }

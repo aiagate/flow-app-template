@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +11,12 @@ import (
 	"github.com/aiagate/flow-app-template/internal/domain"
 	"github.com/aiagate/flow-app-template/internal/usecase"
 )
+
+const testAdminToken = "admin-token"
+
+func testAccountToken(accountID string) string {
+	return accountID + "-token"
+}
 
 type testRepos struct {
 	mu sync.Mutex
@@ -209,11 +216,12 @@ func cloneTestMembership(membership *domain.TeamMembership) *domain.TeamMembersh
 type testWindow struct{ count int64 }
 
 type testGuard struct {
-	mu       sync.Mutex
-	config   *domain.RuntimeConfig
-	accounts map[string]domain.AccountState
-	windows  map[string]*testWindow
-	stats    domain.HotPathStats
+	mu        sync.Mutex
+	config    *domain.RuntimeConfig
+	accounts  map[string]domain.AccountState
+	windows   map[string]*testWindow
+	stats     domain.HotPathStats
+	creditErr error
 }
 
 func newTestGuard(balances map[string]int64) *testGuard {
@@ -244,12 +252,12 @@ func (g *testGuard) AcquireAndDebit(accountID, route string) (domain.HotPathDeci
 	g.stats.Requests++
 	if g.config.MaintenanceMode {
 		g.stats.MaintenanceRejected++
-		return domain.HotPathDecision{}, domain.ErrRouteDisabled
+		return domain.HotPathDecision{Reason: domain.ErrRouteDisabled.Error()}, domain.ErrRouteDisabled
 	}
 	policy, hasPolicy := g.config.Routes[route]
 	if hasPolicy && !policy.Enabled {
 		g.stats.RouteDisabled++
-		return domain.HotPathDecision{}, domain.ErrRouteDisabled
+		return domain.HotPathDecision{Reason: domain.ErrRouteDisabled.Error()}, domain.ErrRouteDisabled
 	}
 	rpm := g.config.DefaultRateLimitRPM
 	if hasPolicy && policy.RateLimitRPM > 0 {
@@ -263,7 +271,9 @@ func (g *testGuard) AcquireAndDebit(accountID, route string) (domain.HotPathDeci
 	if rpm > 0 && window.count >= int64(rpm) {
 		g.stats.RateLimited++
 		return domain.HotPathDecision{
-			Allowed: false, RemainingBalance: g.account(accountID).Balance, RemainingTokens: 0,
+			Allowed: false, Reason: domain.ErrRateLimited.Error(),
+			RemainingBalance: g.account(accountID).Balance, RemainingTokens: 0,
+			RateLimitRPM: rpm,
 		}, domain.ErrRateLimited
 	}
 	window.count++
@@ -276,7 +286,7 @@ func (g *testGuard) AcquireAndDebit(accountID, route string) (domain.HotPathDeci
 		g.stats.InsufficientBalance++
 		return domain.HotPathDecision{
 			Allowed: false, Cost: cost, RemainingBalance: state.Balance,
-			RemainingTokens: int64(rpm) - window.count,
+			RemainingTokens: int64(rpm) - window.count, RateLimitRPM: rpm,
 		}, domain.ErrInsufficientBalance
 	}
 	state.Balance -= cost
@@ -284,7 +294,7 @@ func (g *testGuard) AcquireAndDebit(accountID, route string) (domain.HotPathDeci
 	g.stats.Allowed++
 	return domain.HotPathDecision{
 		Allowed: true, Cost: cost, RemainingBalance: state.Balance,
-		RemainingTokens: int64(rpm) - window.count,
+		RemainingTokens: int64(rpm) - window.count, RateLimitRPM: rpm,
 	}, nil
 }
 func (g *testGuard) Authorize(accountID, route string) (domain.HotPathDecision, error) {
@@ -293,12 +303,12 @@ func (g *testGuard) Authorize(accountID, route string) (domain.HotPathDecision, 
 	g.stats.Requests++
 	if g.config.MaintenanceMode {
 		g.stats.MaintenanceRejected++
-		return domain.HotPathDecision{}, domain.ErrRouteDisabled
+		return domain.HotPathDecision{Reason: domain.ErrRouteDisabled.Error()}, domain.ErrRouteDisabled
 	}
 	policy, hasPolicy := g.config.Routes[route]
 	if hasPolicy && !policy.Enabled {
 		g.stats.RouteDisabled++
-		return domain.HotPathDecision{}, domain.ErrRouteDisabled
+		return domain.HotPathDecision{Reason: domain.ErrRouteDisabled.Error()}, domain.ErrRouteDisabled
 	}
 	rpm := g.config.DefaultRateLimitRPM
 	if hasPolicy && policy.RateLimitRPM > 0 {
@@ -312,20 +322,25 @@ func (g *testGuard) Authorize(accountID, route string) (domain.HotPathDecision, 
 	if rpm > 0 && window.count >= int64(rpm) {
 		g.stats.RateLimited++
 		return domain.HotPathDecision{
-			Allowed: false, RemainingBalance: g.account(accountID).Balance, RemainingTokens: 0,
+			Allowed: false, Reason: domain.ErrRateLimited.Error(),
+			RemainingBalance: g.account(accountID).Balance, RemainingTokens: 0,
+			RateLimitRPM: rpm,
 		}, domain.ErrRateLimited
 	}
 	window.count++
 	g.stats.Allowed++
 	return domain.HotPathDecision{
 		Allowed: true, RemainingBalance: g.account(accountID).Balance,
-		RemainingTokens: int64(rpm) - window.count,
+		RemainingTokens: int64(rpm) - window.count, RateLimitRPM: rpm,
 	}, nil
 }
 func (g *testGuard) Debit(accountID string, amount int64) (domain.HotPathDecision, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	state := g.account(accountID)
+	state, ok := g.accounts[accountID]
+	if !ok {
+		return domain.HotPathDecision{}, port.ErrNotFound
+	}
 	if state.Balance < amount {
 		g.stats.InsufficientBalance++
 		return domain.HotPathDecision{Allowed: false, Cost: amount, RemainingBalance: state.Balance}, domain.ErrInsufficientBalance
@@ -344,18 +359,32 @@ func (g *testGuard) Refund(accountID string, amount int64) {
 	state.Balance += amount
 	g.accounts[accountID] = state
 }
-func (g *testGuard) Credit(accountID string, amount int64) {
+func (g *testGuard) Credit(accountID string, amount int64) error {
 	if amount <= 0 {
-		return
+		return nil
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.creditErr != nil {
+		return g.creditErr
+	}
 	state := g.account(accountID)
 	state.AccountID = accountID
 	if state.RateLimitRPM == 0 {
 		state.RateLimitRPM = 120
 	}
 	state.Balance += amount
+	g.accounts[accountID] = state
+	return nil
+}
+func (g *testGuard) RollbackCredit(accountID string, amount int64) {
+	if amount <= 0 {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	state := g.account(accountID)
+	state.Balance -= amount
 	g.accounts[accountID] = state
 }
 func (g *testGuard) GetAccountState(accountID string) (domain.AccountState, bool) {
@@ -394,25 +423,49 @@ type testQueue struct {
 	quotas  []domain.AccountQuota
 	logs    []domain.RequestLog
 	stats   domain.BatcherStats
+	err     error
 }
 
 func (q *testQueue) EnqueueBilling(event domain.BillingEvent) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.err != nil {
+		return q.err
+	}
 	q.billing = append(q.billing, event)
+	q.stats.Enqueued++
+	return nil
+}
+func (q *testQueue) EnqueueBillingWithQuota(event domain.BillingEvent, quota domain.AccountQuota) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.err != nil {
+		return q.err
+	}
+	q.billing = append(q.billing, event)
+	q.quotas = append(q.quotas, quota)
 	q.stats.Enqueued++
 	return nil
 }
 func (q *testQueue) EnqueueQuotaSync(quota domain.AccountQuota) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.err != nil {
+		return q.err
+	}
 	q.quotas = append(q.quotas, quota)
 	q.stats.Enqueued++
 	return nil
 }
+func (q *testQueue) EnqueueQuotaSyncBlocking(_ context.Context, quota domain.AccountQuota) error {
+	return q.EnqueueQuotaSync(quota)
+}
 func (q *testQueue) EnqueueRequestLog(logRow domain.RequestLog) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.err != nil {
+		return q.err
+	}
 	q.logs = append(q.logs, logRow)
 	q.stats.Enqueued++
 	return nil
@@ -457,20 +510,72 @@ func (q *testQuotas) GetByAccountID(_ context.Context, accountID string) (domain
 }
 
 type testAudit struct {
-	events []domain.BillingEvent
-	logs   []domain.RequestLog
+	events         []domain.BillingEvent
+	logs           []domain.RequestLog
+	billingAccount string
+	logsAccount    string
 }
 
-func (a *testAudit) ListBillingEvents(context.Context, string, int) ([]domain.BillingEvent, error) {
+func (a *testAudit) ListBillingEvents(_ context.Context, accountID string, _ int) ([]domain.BillingEvent, error) {
+	a.billingAccount = accountID
 	return a.events, nil
 }
-func (a *testAudit) ListRequestLogs(context.Context, string, int) ([]domain.RequestLog, error) {
+func (a *testAudit) ListRequestLogs(_ context.Context, accountID string, _ int) ([]domain.RequestLog, error) {
+	a.logsAccount = accountID
 	return a.logs, nil
 }
 
-type testHealth struct{ health domain.DBHealth }
+type testHealth struct {
+	health domain.DBHealth
+}
 
-func (h testHealth) Health(context.Context) (domain.DBHealth, error) { return h.health, nil }
+func (h *testHealth) Health(context.Context) (domain.DBHealth, error) { return h.health, nil }
+
+// testAuthenticator mirrors the static authenticator: one admin token and one
+// token per configured account.
+type testAuthenticator struct {
+	principals map[string]domain.Principal
+}
+
+func newTestAuthenticator() *testAuthenticator {
+	principals := map[string]domain.Principal{
+		testAdminToken: {Subject: "admin", IsAdmin: true},
+	}
+	for _, accountID := range []string{"default", "acct-a", "acct-b"} {
+		principals[testAccountToken(accountID)] = domain.Principal{
+			Subject:   "account:" + accountID,
+			AccountID: accountID,
+		}
+	}
+	return &testAuthenticator{principals: principals}
+}
+
+func (a *testAuthenticator) Authenticate(token string) (domain.Principal, bool) {
+	principal, ok := a.principals[token]
+	return principal, ok
+}
+
+type testRuntimeConfig struct {
+	mu      sync.Mutex
+	saved   *domain.RuntimeConfig
+	saveErr error
+}
+
+func (c *testRuntimeConfig) Load(context.Context) (*domain.RuntimeConfig, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.saved.Clone(), c.saved != nil, nil
+}
+
+func (c *testRuntimeConfig) Save(_ context.Context, cfg *domain.RuntimeConfig) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.saveErr != nil {
+		return c.saveErr
+	}
+	c.saved = cfg.Clone()
+	return nil
+}
 
 type testEnvironment struct {
 	handler *Handler
@@ -479,27 +584,35 @@ type testEnvironment struct {
 	queue   *testQueue
 	quotas  *testQuotas
 	audit   *testAudit
+	health  *testHealth
+	config  *testRuntimeConfig
+	auth    *testAuthenticator
 }
 
 func newTestEnvironment(t *testing.T) *testEnvironment {
 	t.Helper()
 	repos := newTestRepos()
-	guard := newTestGuard(map[string]int64{"default": 1000})
+	guard := newTestGuard(map[string]int64{"default": 1000, "acct-a": 1000, "acct-b": 1000})
 	queue := &testQueue{}
 	quotas := &testQuotas{quotas: make(map[string]domain.AccountQuota)}
 	audit := &testAudit{}
+	health := &testHealth{health: domain.DBHealth{
+		OK: true, JournalMode: "wal", WALAutocheckpoint: 0, WALWarnBytes: 64 << 20,
+		WALHealthy: true, ReadQueryOnly: true, ReadConnections: 5,
+	}}
+	configRepo := &testRuntimeConfig{}
+	auth := newTestAuthenticator()
 
 	users := usecase.NewUserUseCase(repos, repos.Users())
 	teams := usecase.NewTeamUseCase(repos, repos.Teams())
 	memberships := usecase.NewMembershipUseCase(repos, repos.Teams(), repos.Users(), repos.Memberships())
 	billing := usecase.NewBillingUseCase(guard, quotas, audit, queue)
-	runtime := usecase.NewRuntimeUseCase(guard, queue, testHealth{health: domain.DBHealth{
-		OK: true, JournalMode: "wal", WALAutocheckpoint: 0, ReadQueryOnly: true, ReadConnections: 5,
-	}})
+	runtime := usecase.NewRuntimeUseCase(guard, queue, health, configRepo)
 
 	handler, err := NewHandler(Dependencies{
 		Users: users, Teams: teams, Memberships: memberships,
 		Billing: billing, Runtime: runtime, HotPath: guard, Queue: queue,
+		Auth: auth, Logger: slog.New(slog.DiscardHandler),
 	})
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
@@ -508,7 +621,10 @@ func newTestEnvironment(t *testing.T) *testEnvironment {
 	if !ok {
 		t.Fatalf("NewHandler returned %T", handler)
 	}
-	return &testEnvironment{handler: typed, repos: repos, guard: guard, queue: queue, quotas: quotas, audit: audit}
+	return &testEnvironment{
+		handler: typed, repos: repos, guard: guard, queue: queue, quotas: quotas,
+		audit: audit, health: health, config: configRepo, auth: auth,
+	}
 }
 
 func (e *testEnvironment) seedUser(t *testing.T, name, email string) *domain.User {
