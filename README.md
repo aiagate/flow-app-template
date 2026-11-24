@@ -2,381 +2,255 @@
 
 ## 概要
 
-**※現在製作中のプロジェクトです。予期せぬバグ、不具合などが含まれる可能性があります。**
+**Flow App Template** は、Go の Clean Architecture で実装した単一バイナリの API サーバーです。
+SQLite をアプリケーションに埋め込み、Web コンソールと SQL マイグレーションを `embed.FS` で
+バイナリに同梱します。`-trimpath -ldflags "-s -w"` でビルドした Linux バイナリは約 11MB です。
 
-設計の一貫性を保ち、業務ロジックに集中するためのPythonアプリケーションテンプレート。
+- HTTP は標準ライブラリ `net/http` の `http.ServeMux` のみ。外部ルーターは使いません。
+- 永続化は SQLite (`modernc.org/sqlite`)。ORM は使わず、生 SQL のみです。
+- ホットパスはインメモリで判定し、監査履歴は非同期のグループコミットで永続化します。
+- Docker、PostgreSQL、Redis を必要としません。`systemd` と `litestream` による単一バイナリ運用を前提とします。
+- ID は 26 文字の ULID を `TEXT` として保存します。
 
-開発者はユースケース・業務ルールの実装に集中できます。クリーンアーキテクチャと
-プロジェクトの規約、契約テストが設計の一貫性を保つ助けになります。Discord Bot /
-HTTP API / LINE / Worker は任意のエントリポイントであり、このプロジェクトの
-アイデンティティではありません。新機能の追加手順は
-[機能追加ガイド](docs/development/ADDING_FEATURE.md) を参照してください。
+設計の詳細は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)、本番運用と災害復旧は
+[docs/OPERATIONS.md](docs/OPERATIONS.md)、実装規約は [AGENTS.md](AGENTS.md) を参照してください。
 
-## 新しいアプリへの導入
+## 主な特徴
 
-Forkを前提とせず、CloneしたGit履歴を保持したまま独立アプリを開始できます。
-Clone直後に採用元と開始commitを記録し、必要な上流修正は出典付きで選択的に取り込みます。
-自動同期や追加の生成ツールは使いません。
-
-導入手順、新しいリポジトリの作成、更新、複数アプリの開発用DB設定は
-[独立アプリの導入・更新ガイド](docs/development/TEMPLATE_ADOPTION.md)を参照してください。
-
-## 特徴
-
-### 1. **非同期処理の活用**
-
-- `asyncio`を使用して非同期処理を実現。
-- 高速かつ効率的な処理を可能にする設計。
-
-### 2. **依存性注入 (DI)**
-
-- `injector`ライブラリを使用して依存性注入を実現。
-- テスト容易性とモジュール間の疎結合を実現。
-
-### 3. **Mediatorパターンの採用**
-
-- `flow-med`ライブラリを使用してMediatorパターンを実現。
-- リクエストとハンドラーの分離により、コードの可読性と拡張性を向上。
-
-### 4. **クリーンアーキテクチャ**
-
-- ユースケース層 (`usecases/`) とドメイン層 (`domain/`) を明確に分離。
-- ビジネスロジックとインフラストラクチャの独立性を確保。
-- ドメイン層 (`domain/`) とインフラストラクチャ層 (`infrastructure/`) を完全分離。
-
-### 5. **データベース統合**
-
-- **SQLModel + Alembic**: 型安全なORM とマイグレーション管理。
-- **非同期データベース**: aiosqlite による非同期SQLite操作。
-- **クリーンアーキテクチャ準拠**: ORMモデルとドメイン集約を分離。
-- **自動マイグレーション**: Alembicによるスキーマバージョン管理。
-
-### 6. **コグ (Cog) によるコマンド管理**
-
-- `discord.ext.commands`のCogを使用してコマンドをモジュール化。
-- Botの機能を簡単に拡張可能。
-
-### 7. **FastAPI 統合 (Web API)**
-
-- Discord Bot を起動せずに単体で動作するREST API（Bot と並行しての起動も可能）。
-- 共通のユースケースを再利用し、外部システムとの連携が可能。
-- Swagger UI によるインタラクティブなドキュメント。
-
-### 8. **型安全性**
-
-- Pythonの型ヒントを活用し、静的解析ツールによるエラー検出を強化。
-
-### 9. **テスト環境の整備**
-
-- `pytest`と`anyio`を使用し、`asyncio`バックエンドで非同期テストを実行。
-- `pytest-cov`によるコードカバレッジ測定。
-- テストごとに独立した一時ファイルSQLite（外部キー制約有効）を使用。
-
-### 10. **コード品質管理**
-
-- `Ruff`: 高速なコードフォーマッターとリンター。
-- `Pyright`: 厳格な型チェック (strict モード)。
-- `pre-commit`: Git コミット前の自動チェック。
+| 領域 | 内容 |
+| --- | --- |
+| アーキテクチャ | `domain` → `contract` → `usecase` → `presentation` / `infra` の依存方向を `internal/arch_test.go` が検査 |
+| 永続化 | WAL モードの SQLite。書き込み用 1 接続と読み取り専用プールを分離 |
+| ホットパス | `atomic.Pointer[domain.RuntimeConfig]` とアカウント単位の `sync.Mutex` でディスク I/O なしに判定 |
+| 監査履歴 | 8,192 スロットのチャネルと単一ライターによる 15ms / 64 件のグループコミット |
+| コンソール | `/` で配信する埋め込み Web コンソール。ホットパス、キュー、監査履歴を表示 |
+| マイグレーション | `migrations/*.sql` を起動時に自動適用し、`schema_migrations` で追跡 |
+| 運用 | `systemd` unit、Litestream v0.5 による Cloudflare R2 への継続レプリケーション、復旧スクリプト |
 
 ## ディレクトリ構成
 
 ```text
 .
-├── src/app/                      # アプリケーション本体
-│   ├── application/              # Mediatorの構成・アプリケーション境界
-│   ├── contracts/                # 複数レイヤーで共有する境界契約
-│   │   ├── messages/             # イベント・共有メッセージ
-│   │   └── ports/                # UoW・Query・イベントバスのPort
-│   ├── domain/                   # 業務ルール（ORM・入口に依存しない）
-│   │   ├── aggregates/           # ドメイン集約
-│   │   ├── interfaces/           # ドメイン固有の抽象
-│   │   ├── repositories/         # リポジトリ契約
-│   │   └── value_objects/        # 値オブジェクト
-│   ├── usecases/                 # ユースケース・入出力DTO・Handler
-│   │   ├── users/                # ユーザー関連
-│   │   ├── teams/                # チーム関連
-│   │   ├── memberships/          # メンバーシップ関連
-│   │   └── chat/                 # チャット保存
-│   ├── infrastructure/           # Port・永続化の実装
-│   │   ├── mappings/             # ドメイン集約とORMの明示的変換
-│   │   ├── orm_models/           # SQLModelによるテーブル定義
-│   │   ├── repositories/         # リポジトリ実装
-│   │   └── unit_of_work.py       # トランザクションとRepositoryの寿命
-│   ├── presentation/             # 必要な入口のみを利用
-│   │   ├── api/                  # HTTP API (start-api)
-│   │   ├── bot/                  # Discord Bot (start-bot)
-│   │   ├── line/                 # LINE (start-line)
-│   │   └── worker/               # プロセスローカルのイベント処理
-│   ├── container.py              # DIコンテナ設定
-│   └── environment.py            # 全入口共通の環境変数ローダー
-├── alembic/                       # Alembicマイグレーション
-│   └── versions/                  # マイグレーションファイル
-├── docs/                          # ドキュメント
-├── tests/                         # テストコード
-├── .pre-commit-config.yaml        # Pre-commit設定
-├── pyproject.toml                 # プロジェクト設定
-└── README.md                      # このファイル
+├── cmd/server/                  # composition root とプロセス起動・終了
+│   ├── main.go
+│   └── main_test.go
+├── internal/
+│   ├── domain/                  # 集約、値オブジェクト、業務ルール（I/O なし）
+│   ├── contract/
+│   │   ├── port/                # 永続化・ホットパス・キューのインターフェース
+│   │   └── message/             # レイヤーを越える共有 DTO・トピック
+│   ├── usecase/                 # ユースケースと入出力 DTO
+│   ├── infra/
+│   │   ├── config/              # 環境変数の読み込みと検証
+│   │   ├── sqlite/              # 生 SQL リポジトリ、二重プール、マイグレーション適用
+│   │   ├── hotpath/             # インメモリの admission・残高・テレメトリ
+│   │   └── batcher/             # 非同期グループコミットキュー
+│   ├── presentation/httpapi/    # JSON API、ミドルウェア、埋め込みコンソール配信
+│   └── arch_test.go             # 依存方向の検査
+├── migrations/                  # 埋め込み SQL マイグレーション
+│   ├── 0001_init.sql
+│   └── embed.go
+├── web/                         # 埋め込み Web コンソール
+│   ├── embed.go
+│   └── static/
+├── deploy/
+│   ├── systemd/                 # flow-api.service、litestream.service、環境変数例
+│   └── litestream/              # litestream.yml、restore.sh
+├── docs/
+│   ├── ARCHITECTURE.md
+│   └── OPERATIONS.md
+├── .github/
+│   ├── pull_request_template.md
+│   └── workflows/ci.yml         # Go の CI
+├── .env.example                 # ローカル開発用の環境変数例
+├── .gitignore
+├── go.mod
+├── go.sum
+├── LICENSE
+├── AGENTS.md                    # 実装規約
+└── README.md
 ```
 
-## 実装方式の選択
+各パッケージのテストは `*_test.go` として同じディレクトリに置きます。
 
-単純な業務処理、状態遷移を持つモデル、読み取り専用Queryの選び分けは
-[業務に応じた実装の選び方](docs/development/IMPLEMENTATION_CHOICES.md)を参照してください。
-集約・Value Object・汎用Repositoryは、すべての機能への必須条件ではありません。
+## クイックスタート
 
-## 必要な環境
-
-- Python 3.13 以上
-- Git（独立導入、採用元の記録、上流修正の取り込みに使用）
-- パッケージ管理 [uv](https://github.com/astral-sh/uv)
-- 必要な依存関係は`pyproject.toml`に記載されています。
-
-## セットアップ
-
-1. 仮想環境を作成:
-
-   ```bash
-   uv venv -p 3.13 .venv
-   source .venv/bin/activate  # Windows(PS)の場合は .venv\Scripts\activate
-   ```
-
-2. 依存関係をインストール（以下は全入口の開発用）:
-
-   APIだけ等の選択導入は[入口ごとの依存管理](docs/development/OPTIONAL_ENTRYPOINTS.md)を参照してください。
-   本番で不要なSDKを省く場合は、`--no-dev --extra api`等で必要な入口を指定します。
-
-   ```bash
-   uv sync --frozen --all-extras
-   ```
-
-3. Pre-commit フックをインストール:
-
-   ```bash
-   uv run pre-commit install
-   ```
-
-4. 環境変数を設定:
-
-   `.env.example`を`.env`または`.env.local`にコピーして編集:
-
-   ```bash
-   # .env.local を作成
-   cp .env.example .env.local
-   ```
-
-   `.env.local`の内容を編集:
-
-   ```bash
-   # Discord Bot を使う場合のみ必須（HTTP API単体では不要）
-   DISCORD_BOT_TOKEN=your_discord_bot_token_here
-
-   # データベースURL（オプション、デフォルト: sqlite+aiosqlite:///./bot.db）
-   DATABASE_URL=sqlite+aiosqlite:///./bot.db
-   ```
-
-   環境変数の読み込みは全エントリポイント（Bot / API / Worker / LINE /
-   Alembic）で共通です（`src/app/environment.py`）。優先順位は次のとおりです:
-
-   1. 既に設定されたプロセス環境変数（外部提供分は上書きしない）
-   2. プロジェクトルートの `.env.local`（開発環境用）
-   3. プロジェクトルートの `.env`（`.env.local` に無いキーのフォールバック）
-
-   読み込み対象は明示的に解決したプロジェクトルートのみで、
-   カレントディレクトリやその親ディレクトリは探索しません。
-   ファイルが存在しない場合は無視されます。
-
-5. データベースマイグレーションを実行:
-
-   ```bash
-   # マイグレーション適用
-   uv run alembic upgrade head
-
-   # マイグレーション状態確認
-   uv run alembic current
-   ```
-
-6. アプリケーションを起動:
-
-   Discord Botを起動:
-
-   ```bash
-   uv run --frozen --extra discord start-bot
-   ```
-
-   または、Web APIサーバーを起動:
-
-   ```bash
-   uv run --frozen --extra api start-api
-   ```
-
-## データベース管理
-
-### マイグレーション操作
+必要なものは Go 1.26 以上です。CGO は不要で、SQLite ドライバは純 Go 実装です。
 
 ```bash
-# スキーマ変更後、マイグレーションを自動生成
-uv run alembic revision --autogenerate -m "Add new field"
+git clone https://github.com/aiagate/flow-app-template.git
+cd flow-app-template
 
-# マイグレーション適用
-uv run alembic upgrade head
-
-# 1つ前に戻す
-uv run alembic downgrade -1
-
-# 現在のマイグレーション確認
-uv run alembic current
-
-# マイグレーション履歴表示
-uv run alembic history
+cp .env.example .env
+go run ./cmd/server
 ```
 
-### データベース構造
+起動すると `./data/flow.db` が作成され、未適用のマイグレーションが自動で適用されます。
 
-- **使用DB**: SQLite (開発時) / PostgreSQL (本番推奨)
-- **ORM**: SQLModel
-- **マイグレーション**: Alembic
-- **非同期対応**: aiosqlite
-
-## テスト実行
-
-データベースを伴うテストは環境変数 `TEST_DATABASE_URL` で接続先を制御できます。
-未指定または `sqlite+aiosqlite://` の場合はテストごとに独立した一時ファイルSQLite（外部キー制約有効）が使用されます。
-`postgresql+asyncpg://...` を指定した場合はUUIDによる独立したスキーマで隔離実行されます。
+- Web コンソール: <http://localhost:8080/>
+- ヘルスチェック: <http://localhost:8080/healthz>
 
 ```bash
-# 全テスト実行（SQLite一時ファイル、デフォルト）
-TEST_DATABASE_URL=sqlite+aiosqlite:// uv run --frozen --all-extras pytest
-
-# PostgreSQL環境での実行例（※テスト用DBを指定すること）
-TEST_DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/test_db uv run --frozen --all-extras pytest
-
-# カバレッジ付きで実行
-uv run --frozen --all-extras pytest --cov=app --cov-report=term-missing
-
-# 特定のテストファイルのみ実行
-uv run --frozen --all-extras pytest tests/infrastructure/test_repositories.py
+curl -fsS http://localhost:8080/healthz
 ```
 
-## コード品質チェック
+```json
+{
+  "status": "ok",
+  "db": {
+    "ok": true,
+    "journal_mode": "wal",
+    "wal_autocheckpoint": 0,
+    "read_query_only": true,
+    "read_connections": 5
+  }
+}
+```
+
+`/healthz` は DB の実効 PRAGMA が期待どおりでない場合も HTTP 200 を返し、`status` を
+`degraded` にします。監視では HTTP ステータスだけでなく `status` と `db.ok` を確認してください。
+
+### 設定の読み込み
+
+`config.Load` はプロジェクトルート（`go.mod` のあるディレクトリ）の `.env.local`、次に `.env` を
+読みます。すでに設定済みのプロセス環境変数が常に優先されます。本番の `systemd` では
+`EnvironmentFile=/etc/flow-api/flow-api.env` を使い、`.env` ファイルは配置しません。
+
+| 環境変数 | 既定値 | 説明 |
+| --- | --- | --- |
+| `HTTP_ADDR` | `:8080` | HTTP の待ち受けアドレス。`host:port` 形式 |
+| `DB_PATH` | `./data/flow.db` | SQLite ファイル。親ディレクトリは自動作成 |
+| `DB_READ_CONNS` | `5` | 読み取りプールの接続数。`[4, 6]` にクランプ |
+| `DEFAULT_INITIAL_BALANCE` | `1000` | 新規アカウントの初期残高。0 以上 |
+| `DEFAULT_RATE_LIMIT_RPM` | `120` | 既定の 1 分あたりリクエスト上限。正の整数 |
+| `DEFAULT_REQUEST_COST` | `1` | 課金対象ルートの既定コスト。0 以上 |
+| `SHUTDOWN_TIMEOUT` | `10s` | HTTP 停止、最終スナップショット、キュー排出の期限 |
+
+Cloudflare R2 と Litestream の環境変数はアプリケーションではなく Litestream が使います。
+一覧と設定方法は [docs/OPERATIONS.md](docs/OPERATIONS.md) を参照してください。
+
+## REST API
+
+### 共通仕様
+
+- リクエストとレスポンスは JSON です。リクエストボディの上限は 1 MiB です。
+- `X-Account-ID` で課金アカウントを選択します。省略または空の場合は `default` を使います。
+- `X-Request-ID` が指定されればその値を引き継ぎ、なければ ULID を生成します。実効値はレスポンスヘッダにも返します。
+- 課金対象ルートでは `X-RateLimit-Limit`、`X-RateLimit-Remaining`、`X-Account-Balance` を返します。
+- エラーは共通のエンベロープです。
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "email: must be a valid email address"
+  }
+}
+```
+
+| HTTP | エラーコード |
+| --- | --- |
+| 400 | `VALIDATION_ERROR` |
+| 402 | `INSUFFICIENT_BALANCE` |
+| 404 | `NOT_FOUND` |
+| 409 | `CONFLICT`、`CONCURRENCY_CONFLICT` |
+| 429 | `RATE_LIMITED` |
+| 500 | `UNEXPECTED` |
+| 503 | `ROUTE_DISABLED` |
+
+### エンドポイント一覧
+
+「課金」列の「対象」は、ハンドラ実行前にホットパスがコストを事前引き落としするルートです。
+`/charge` だけは事前引き落としをせず、ハンドラが明示的に 1 回だけ引き落とします。
+
+| Method | Path | 用途 | 課金 |
+| --- | --- | --- | --- |
+| GET | `/` | 埋め込み Web コンソール | なし |
+| GET | `/assets/{path...}` | コンソールの静的アセット | なし |
+| GET | `/healthz` | ヘルスチェックと実効 PRAGMA | なし |
+| GET | `/api/v1/runtime/config` | 実行時設定の取得 | なし |
+| PUT | `/api/v1/runtime/config` | 実行時設定の更新（メンテナンス、ルートポリシー） | なし |
+| GET | `/api/v1/runtime/stats` | ホットパス、Batcher、DB の統計 | なし |
+| GET | `/api/v1/accounts/{account_id}` | 残高とレート上限の取得 | なし |
+| POST | `/api/v1/accounts/{account_id}/credit` | 残高の加算と監査イベント記録 | なし |
+| POST | `/api/v1/accounts/{account_id}/charge` | 明示的な残高の引き落とし | 単一 Debit |
+| GET | `/api/v1/billing/events` | 課金イベントの一覧 | なし |
+| GET | `/api/v1/logs` | リクエストログの一覧 | なし |
+| POST | `/api/v1/users` | ユーザー作成 | 対象 |
+| GET | `/api/v1/users` | ユーザー一覧 | 対象 |
+| GET | `/api/v1/users/{id}` | ユーザー取得 | 対象 |
+| PUT | `/api/v1/users/{id}/email` | メールアドレス変更 | 対象 |
+| POST | `/api/v1/teams` | チーム作成 | 対象 |
+| GET | `/api/v1/teams` | チーム一覧 | 対象 |
+| GET | `/api/v1/teams/{id}` | チーム取得 | 対象 |
+| PUT | `/api/v1/teams/{id}` | チーム名変更 | 対象 |
+| POST | `/api/v1/teams/{team_id}/memberships/join` | 即時参加（`ACTIVE`） | 対象 |
+| POST | `/api/v1/teams/{team_id}/memberships/request` | 参加リクエスト（`PENDING`） | 対象 |
+| GET | `/api/v1/teams/{team_id}/memberships` | チームのメンバーシップ履歴 | 対象 |
+| POST | `/api/v1/memberships/{id}/approve` | 参加リクエストの承認 | 対象 |
+| POST | `/api/v1/memberships/{id}/leave` | 脱退 | 対象 |
+| PUT | `/api/v1/memberships/{id}/role` | ロール変更 | 対象 |
+| * | 上記以外 | JSON の 404 エラー | なし |
+
+`POST /api/v1/users`、`POST /api/v1/teams`、`POST /api/v1/teams/{team_id}/memberships/join`、
+`POST /api/v1/teams/{team_id}/memberships/request` は成功時に 201 を返します。それ以外の成功は
+200 です。
+
+### 主なリクエストボディ
+
+| エンドポイント | ボディ |
+| --- | --- |
+| `POST /api/v1/users` | `{"display_name":"...","email":"..."}` |
+| `PUT /api/v1/users/{id}/email` | `{"email":"...","expected_version":1}`（`expected_version` は任意） |
+| `POST /api/v1/teams` | `{"name":"..."}` |
+| `PUT /api/v1/teams/{id}` | `{"name":"...","expected_version":1}`（`expected_version` は任意） |
+| `POST /api/v1/teams/{team_id}/memberships/join` | `{"user_id":"..."}` |
+| `POST /api/v1/teams/{team_id}/memberships/request` | `{"user_id":"..."}` |
+| `PUT /api/v1/memberships/{id}/role` | `{"role":"OWNER"}`（`OWNER` / `ADMIN` / `MEMBER`） |
+| `POST /api/v1/accounts/{account_id}/credit` | `{"amount":100,"reason":"..."}` |
+| `POST /api/v1/accounts/{account_id}/charge` | `{"amount":10,"reason":"..."}` |
+| `PUT /api/v1/runtime/config` | `{"default_rate_limit_rpm":120,"default_request_cost":1,"maintenance_mode":false,"routes":{...}}` |
+
+`GET /api/v1/billing/events` は任意の `account_id` と `limit`（1〜1000、既定 100）を受け付けます。
+`GET /api/v1/logs` は `limit` のみを受け付けます。
+
+### 課金の扱い
+
+- 課金対象ルートは、ハンドラ実行前に `AcquireAndDebit` でコストを引き落とします。
+- ハンドラが 5xx を返した場合はコストを返金します。5xx 未満のレスポンスではコストが確定し、課金イベントが記録されます。
+- メンテナンス、ルート無効、レート制限、残高不足で拒否されたリクエストは引き落としません。
+- `/charge` は `Authorize` でメンテナンス、ルートポリシー、レート制限だけを確認し、ハンドラの `Debit` が金額を 1 回だけ引き落とします。
+
+## ビルドと検証
+
+変更後は次のコマンドを順に実行し、すべて通ることを確認します。
 
 ```bash
-# フォーマット
-uv run ruff format .
-
-# リントチェック
-uv run ruff check .
-
-# リント自動修正
-uv run ruff check . --fix
-
-# 型チェック
-uv run --all-extras pyright
-
-# 全チェック実行
-uv run ruff format . && \
-uv run ruff check . --fix && \
-uv run --all-extras pyright && \
-uv run --all-extras pytest
+gofmt -s -w .
+go vet ./...
+CGO_ENABLED=1 go test -race -count=1 ./...
+CGO_ENABLED=0 go test -count=1 ./...
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" ./cmd/server
 ```
 
-## Discord Developer Portal とサーバー権限の設定（最小権限）
+- `CGO_ENABLED=1` の race テストには C コンパイラが必要です。
+- `modernc.org/sqlite` は CGO 不要のため、`CGO_ENABLED=0` でも全テストが通る状態を保ちます。
+- Linux 向けの静的バイナリの作成と配置は [docs/OPERATIONS.md](docs/OPERATIONS.md) を参照してください。
 
-現行機能は最小限の Gateway Intents のみを有効化します
-（`src/app/presentation/bot/intents.py`）:
+## ドキュメント
 
-| Intent               | 必要な理由                                             |
-| -------------------- | ------------------------------------------------------ |
-| `guilds`             | ギルド（サーバー）メタデータ。コマンドのコンテキスト取得 |
-| `guild_messages`     | ギルド内メッセージイベント。`!` プレフィックスコマンドの受信 |
-| `dm_messages`        | DM メッセージイベント。DM 履歴の永続化                  |
-| `message_content`    | **特権 Intent（Message Content Intent）**。`!` コマンドの引数解析と DM 本文の保存 |
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — レイヤー、ドメイン、SQLite 二重プール、ホットパス、Batcher、マイグレーション
+- [docs/OPERATIONS.md](docs/OPERATIONS.md) — クロスコンパイル、`systemd`、Litestream v0.5 と R2、5 分で復旧するランブック
+- [AGENTS.md](AGENTS.md) — 実装原則、依存方向、ビルドと検証、Git 規約
 
-`message_content` は特権 Intent のため、Developer Portal の Bot 設定で
-Message Content Intent を明示的に有効化する必要があります。
-有効化しない Intent: メンバー一覧（members）、プレゼンス（presences）、
-タイピング、音声、リアクション、BAN、招待、Webhook、自動モデレーション等は
-現行機能で不要のため無効です。
+### デプロイ資材
 
-Discord サーバー側で付与する権限は次の最小集合です:
-
-- チャンネルの閲覧（View Channels）
-- メッセージ送信（Send Messages）
-
-Administrator / Manage Roles / Manage Server は不要です。
-なお、ドメイン層の「チームロール（membership role）」はアプリ内データであり、
-Discord のサーバーロール操作とは無関係です。
-
-## 利用可能なDiscordコマンド
-
-### ユーザー管理 (Users)
-
-- `!users get <user_id>`: ユーザー情報を取得
-- `!users create <name> <email>`: 新規ユーザーを作成
-
-### チーム管理 (Teams)
-
-- `!teams get <team_id>`: チーム情報を取得
-- `!teams create <name>`: 新規チームを作成
-- `!teams update <team_id> <new_name>`: チーム名を更新
-- `!teams join <team_id> <user_id>`: チームに参加 (即時)
-- `!teams request <team_id> <user_id>`: チーム参加リクエストを送信
-
-### メンバーシップ管理 (Memberships)
-
-- `!memberships approve <membership_id>`: 参加リクエストを承認
-- `!memberships leave <membership_id>`: チームから脱退
-- `!memberships role <membership_id> <role>`: メンバーのロールを変更
-
-## アーキテクチャ
-
-Repositoryの外部事例と、汎用実装・専用Port・Session直接利用の比較は
-[Repository設計の比較](docs/development/REPOSITORY_DESIGN.md)を参照してください。
-
-このテンプレートは以下のレイヤーで構成されています：
-
-```text
-┌─────────────────────────────────────┐  ┌─────────────────────────────────────┐
-│    Presentation Layer (Web API)     │  │  Presentation Layer (Discord Bot)   │
-│           (FastAPI)                 │  │          (discord.py)               │
-└──────────────────┬──────────────────┘  └──────────────────┬──────────────────┘
-                   │                                        │
-┌──────────────────▼────────────────────────────────────────▼──────────────────┐
-│                        Application Layer (UseCases)                          │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                         Domain Layer (Aggregates)                            │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                     Infrastructure Layer (Repository)                        │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 依存関係の方向
-
-- 上位層から下位層への依存のみ許可
-- ドメイン層はインフラストラクチャに依存しない
-- リポジトリパターンで永続化を抽象化
-
-### イベント配信について
-
-イベントバスは `InMemoryEventBus`（`IEventBus` の実装）のみを使用し、
-Worker を含む全プロセスで**プロセスローカルなイベント配信**を行います。
-**プロセスをまたいだイベント配信（Redis 等の外部バックエンド）は行いません**。
-
-### 詳細ドキュメント
-
-プロジェクトの詳細なドキュメントは `docs/` ディレクトリにあります：
-
-- **[機能追加ガイド](docs/development/ADDING_FEATURE.md)** - 新機能・集約の追加手順（正本）
-- **[アーキテクチャ設計](docs/ARCHITECTURE.md)** - システム全体のアーキテクチャ詳細
-- **[Domain層実装ガイド](docs/domain/DOMAIN_IMPLEMENTATION_GUIDE.md)** - ドメインモデルの実装方法
-- **[データベースマイグレーション](docs/infrastructure/DATABASE_MIGRATIONS.md)** - Alembicによるマイグレーション管理
-
-## TODO
-
-- Domain層の拡充（より多くの集約の追加）
-- 複数データベースソリューションへの対応（PostgreSQL、MySQL等）
-- 認証、認可の仕組みの導入
-- イベントソーシング対応
+- [deploy/systemd/flow-api.service](deploy/systemd/flow-api.service) — API の systemd unit
+- [deploy/systemd/litestream.service](deploy/systemd/litestream.service) — Litestream の systemd unit
+- [deploy/systemd/flow-api.env.example](deploy/systemd/flow-api.env.example) — 本番環境変数の例
+- [deploy/litestream/litestream.yml](deploy/litestream/litestream.yml) — Litestream v0.5 の設定
+- [deploy/litestream/restore.sh](deploy/litestream/restore.sh) — 復旧スクリプト
 
 ## ライセンス
 
-このプロジェクトは[MITライセンス](LICENSE)の下で公開されています。
+このプロジェクトは [MIT ライセンス](LICENSE) の下で公開されています。

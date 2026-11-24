@@ -1,0 +1,30 @@
+# Litestream v0.5.x configuration for Cloudflare R2.
+# Environment variables come from /etc/flow-api/flow-api.env via systemd.
+# Syntax deliberately uses v0.5 keys: l0-retention, snapshot, retention object,
+# and a singular replica (the v0.3 scalar retention and replicas list are gone).
+
+sync-interval: 10s
+l0-retention: 24h
+l0-retention-check-interval: 15s
+
+snapshot:
+  interval: 24h
+  retention: 24h
+
+retention:
+  enabled: true
+
+logging:
+  level: info
+  type: json
+
+dbs:
+  - path: ${LITESTREAM_DB_PATH}
+    checkpoint-interval: 1m
+    monitor-interval: 1s
+    busy-timeout: 5s
+    replica:
+      url: "s3://${R2_BUCKET}/${R2_PREFIX}?endpoint=https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com&region=auto"
+      access-key-id: ${R2_ACCESS_KEY_ID}
+      secret-access-key: ${R2_SECRET_ACCESS_KEY}
+      sync-interval: 10s

@@ -1,0 +1,37 @@
+[Unit]
+Description=Litestream continuous replication for Flow API SQLite
+Documentation=https://litestream.io/
+After=network-online.target flow-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=flow-api
+Group=flow-api
+WorkingDirectory=/var/lib/flow-api
+StateDirectory=flow-api
+StateDirectoryMode=0750
+UMask=0027
+EnvironmentFile=/etc/flow-api/flow-api.env
+ExecStart=/usr/local/bin/litestream replicate -config /etc/flow-api/litestream.yml
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/flow-api
+LimitNOFILE=65536
+MemoryMax=256M
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

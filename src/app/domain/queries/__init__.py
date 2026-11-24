@@ -1,1 +1,0 @@
-"""Domain query types."""

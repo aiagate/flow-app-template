@@ -1,0 +1,568 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="Operations console for the Flow API: hot-path counters, the 8,192-slot write batcher, runtime config, accounts, users, teams, memberships, and audit history.">
+  <title>Flow API · Operations Console</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="app-header">
+    <div class="header-inner">
+      <a class="brand" href="/" aria-label="Flow API console home">
+        <span class="brand-mark" aria-hidden="true">F</span>
+        <span class="brand-copy">
+          <span class="brand-name">Flow API</span>
+          <span class="brand-sub">Operations console</span>
+        </span>
+      </a>
+
+      <nav class="main-nav" aria-label="Sections">
+        <a href="#overview">Overview</a>
+        <a href="#runtime">Runtime</a>
+        <a href="#accounts">Accounts</a>
+        <a href="#users">Users</a>
+        <a href="#teams">Teams</a>
+        <a href="#memberships">Memberships</a>
+        <a href="#audit">Audit</a>
+      </nav>
+
+      <form class="account-picker" id="account-form" autocomplete="off">
+        <label for="account-id">X-Account-ID</label>
+        <div class="account-picker__controls">
+          <input class="input input--compact" id="account-id" name="account-id" type="text" value="default" spellcheck="false" autocapitalize="off" aria-describedby="account-hint">
+          <button class="btn btn--primary btn--sm" type="submit">Apply</button>
+        </div>
+        <span class="visually-hidden" id="account-hint">Sets the X-Account-ID header on every API request. Press Enter or Apply to switch accounts.</span>
+      </form>
+    </div>
+  </header>
+
+  <main class="container" id="main">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="eyebrow"><span class="eyebrow-line" aria-hidden="true"></span> Live operations</p>
+        <h1 id="hero-title">Everything the API is doing, right now.</h1>
+        <p class="hero-sub">Hot-path admission, the 8,192-slot group-commit batcher, and append-only audit history — served by the same embedded Go binary.</p>
+      </div>
+      <div class="hero-actions">
+        <span class="pill pill--neutral" id="connection-pill" role="status" aria-live="polite">
+          <span class="pill__dot" aria-hidden="true"></span>
+          <span id="connection-text">Connecting…</span>
+        </span>
+        <span class="muted small" id="last-updated">Not refreshed yet</span>
+        <button class="btn btn--primary" id="refresh-all" type="button">Refresh all</button>
+      </div>
+    </section>
+
+    <div class="banner banner--warning" id="maintenance-banner" hidden>
+      <strong>Maintenance mode is on.</strong>
+      <span>Hot-path requests are rejected until maintenance mode is disabled in Runtime config.</span>
+    </div>
+
+    <section class="section" id="overview" aria-labelledby="overview-title">
+      <div class="section-heading">
+        <div>
+          <p class="section-kicker">Overview</p>
+          <h2 id="overview-title">Runtime health</h2>
+          <p>Live PRAGMAs, in-memory admission counters, and the asynchronous write queue. Refreshes every five seconds while this tab is visible.</p>
+        </div>
+      </div>
+
+      <div class="stat-grid">
+        <article class="card stat-card">
+          <header class="card-header">
+            <h3>Health &amp; PRAGMAs</h3>
+            <span class="badge badge--neutral" id="health-status">—</span>
+          </header>
+          <dl class="metric-list">
+            <div class="metric-row">
+              <dt>Journal mode</dt>
+              <dd class="mono" id="health-journal">—</dd>
+            </div>
+            <div class="metric-row">
+              <dt>WAL autocheckpoint</dt>
+              <dd class="mono" id="health-wal">—</dd>
+            </div>
+            <div class="metric-row">
+              <dt>Read query only</dt>
+              <dd class="mono" id="health-query">—</dd>
+            </div>
+            <div class="metric-row">
+              <dt>Database</dt>
+              <dd class="mono" id="health-db">—</dd>
+            </div>
+            <div class="metric-row">
+              <dt>Read pool connections</dt>
+              <dd class="mono" id="db-read-conns">—</dd>
+            </div>
+          </dl>
+          <p class="card-note">Checkpoints are delegated to Litestream; the writer keeps <span class="mono">wal_autocheckpoint = 0</span>.</p>
+        </article>
+
+        <article class="card stat-card">
+          <header class="card-header">
+            <h3>Hot path</h3>
+            <span class="badge badge--neutral" id="hotpath-mode">ADMISSION</span>
+          </header>
+          <div class="tile-grid">
+            <div class="tile">
+              <span class="tile-label">Requests</span>
+              <strong class="tile-value" id="hp-requests">—</strong>
+            </div>
+            <div class="tile">
+              <span class="tile-label">Allowed</span>
+              <strong class="tile-value tile-value--success" id="hp-allowed">—</strong>
+            </div>
+            <div class="tile">
+              <span class="tile-label">Rate limited</span>
+              <strong class="tile-value tile-value--warning" id="hp-rate-limited">—</strong>
+            </div>
+            <div class="tile">
+              <span class="tile-label">Insufficient balance</span>
+              <strong class="tile-value tile-value--danger" id="hp-insufficient">—</strong>
+            </div>
+            <div class="tile">
+              <span class="tile-label">Route disabled</span>
+              <strong class="tile-value tile-value--warning" id="hp-route-disabled">—</strong>
+            </div>
+            <div class="tile">
+              <span class="tile-label">Maintenance rejected</span>
+              <strong class="tile-value tile-value--danger" id="hp-maintenance">—</strong>
+            </div>
+          </div>
+          <p class="card-note">Counters are in-memory <span class="mono">atomic.Int64</span> values; no disk I/O on admission.</p>
+        </article>
+
+        <article class="card stat-card">
+          <header class="card-header">
+            <h3>Batcher queue</h3>
+            <span class="badge badge--neutral" id="batcher-state">—</span>
+          </header>
+          <div class="queue">
+            <div class="queue-head">
+              <span>Queue depth</span>
+              <span class="mono"><strong id="batcher-len">—</strong> / <span id="batcher-cap">8192</span></span>
+            </div>
+            <div class="gauge" id="batcher-gauge-track" role="progressbar" aria-label="Batcher queue depth" aria-valuemin="0" aria-valuemax="8192" aria-valuenow="0">
+              <div class="gauge-fill" id="batcher-gauge"></div>
+            </div>
+            <p class="queue-label" id="batcher-gauge-label">Awaiting metrics</p>
+          </div>
+          <div class="tile-grid tile-grid--compact">
+            <div class="tile">
+              <span class="tile-label">Enqueued</span>
+              <strong class="tile-value" id="batcher-enqueued">—</strong>
+            </div>
+            <div class="tile">
+              <span class="tile-label">Flushed</span>
+              <strong class="tile-value" id="batcher-flushed">—</strong>
+            </div>
+            <div class="tile">
+              <span class="tile-label">Flush commits</span>
+              <strong class="tile-value" id="batcher-flush-commits">—</strong>
+            </div>
+            <div class="tile">
+              <span class="tile-label">Dropped</span>
+              <strong class="tile-value tile-value--danger" id="batcher-dropped">—</strong>
+            </div>
+          </div>
+          <p class="card-note">Group commits flush every 15 ms or at 64 events in a single SQLite transaction.</p>
+        </article>
+      </div>
+
+      <p class="inline-error" id="overview-error" hidden></p>
+
+      <details class="card raw-card">
+        <summary>Raw runtime stats payload</summary>
+        <pre class="code-block" id="stats-raw">No stats loaded yet.</pre>
+      </details>
+    </section>
+
+    <section class="section" id="runtime" aria-labelledby="runtime-title">
+      <div class="section-heading">
+        <div>
+          <p class="section-kicker">Control plane</p>
+          <h2 id="runtime-title">Runtime config</h2>
+          <p>Atomically swaps the immutable snapshot read by the hot path. Route overrides win over the defaults.</p>
+        </div>
+        <button class="btn btn--ghost btn--sm" id="runtime-refresh" type="button">Reload config</button>
+      </div>
+
+      <article class="card">
+        <form id="runtime-form" novalidate>
+          <div class="form-grid">
+            <div class="field">
+              <label for="cfg-default-rpm">Default rate limit <span class="muted">(RPM)</span></label>
+              <input class="input" id="cfg-default-rpm" name="default_rate_limit_rpm" type="number" min="1" step="1" inputmode="numeric" value="120">
+            </div>
+            <div class="field">
+              <label for="cfg-default-cost">Default request cost</label>
+              <input class="input" id="cfg-default-cost" name="default_request_cost" type="number" min="0" step="1" inputmode="numeric" value="1">
+            </div>
+            <div class="field field--switch">
+              <span class="label-text" id="maintenance-label">Maintenance mode</span>
+              <label class="switch">
+                <input id="cfg-maintenance" name="maintenance_mode" type="checkbox" aria-labelledby="maintenance-label">
+                <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+                <span class="switch-text" id="maintenance-state">Disabled</span>
+              </label>
+            </div>
+            <div class="field field--action">
+              <button class="btn btn--primary" id="runtime-save" type="submit" disabled>Save runtime config</button>
+            </div>
+          </div>
+
+          <div class="subsection-heading">
+            <div>
+              <h3>Route policies</h3>
+              <p>Per-route enablement, cost, and rate limit. Empty means every route uses the defaults above.</p>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Route</th>
+                  <th scope="col">Enabled</th>
+                  <th scope="col">Cost</th>
+                  <th scope="col">Rate limit (RPM)</th>
+                  <th scope="col" class="cell--action">Remove</th>
+                </tr>
+              </thead>
+              <tbody id="route-rows">
+                <tr>
+                  <td class="empty" colspan="5">No route overrides loaded.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p class="inline-error" id="runtime-error" hidden></p>
+        </form>
+
+        <form class="inline-form" id="route-add-form" autocomplete="off">
+          <div class="field field--grow">
+            <label for="route-add-name">Add route override</label>
+            <input class="input" id="route-add-name" name="route" type="text" placeholder="/api/v1/example" spellcheck="false">
+          </div>
+          <button class="btn btn--ghost" type="submit">Add route</button>
+        </form>
+      </article>
+    </section>
+
+    <section class="section" id="accounts" aria-labelledby="accounts-title">
+      <div class="section-heading">
+        <div>
+          <p class="section-kicker">Ledger</p>
+          <h2 id="accounts-title">Account balance</h2>
+          <p>Current quota for the active <span class="mono">X-Account-ID</span>. Credits and charges are persisted through the write batcher.</p>
+        </div>
+        <button class="btn btn--ghost btn--sm" id="account-refresh" type="button">Reload account</button>
+      </div>
+
+      <article class="card">
+        <div class="account-summary">
+          <div>
+            <p class="label-text">Active account</p>
+            <h3 class="account-id" id="account-id-display">default</h3>
+            <p class="muted small" id="account-updated">No account snapshot yet.</p>
+          </div>
+          <div class="balance">
+            <span class="balance-value" id="account-balance">—</span>
+            <span class="balance-unit">credits</span>
+          </div>
+          <dl class="account-meta">
+            <div>
+              <dt>Rate limit</dt>
+              <dd class="mono" id="account-rpm">—</dd>
+            </div>
+          </dl>
+        </div>
+
+        <div class="split-forms">
+          <form class="subcard" id="credit-form" autocomplete="off">
+            <h3>Credit account</h3>
+            <p class="muted small">Adds balance immediately in the hot path and queues a billing event.</p>
+            <div class="form-grid form-grid--tight">
+              <div class="field">
+                <label for="credit-amount">Amount</label>
+                <input class="input" id="credit-amount" name="amount" type="number" min="1" step="1" inputmode="numeric" placeholder="500" required>
+              </div>
+              <div class="field">
+                <label for="credit-reason">Reason</label>
+                <input class="input" id="credit-reason" name="reason" type="text" placeholder="manual top-up" maxlength="200" required>
+              </div>
+            </div>
+            <button class="btn btn--primary" type="submit">Credit</button>
+          </form>
+
+          <form class="subcard" id="charge-form" autocomplete="off">
+            <h3>Charge account</h3>
+            <p class="muted small">Deducts balance and records an append-only billing event.</p>
+            <div class="form-grid form-grid--tight">
+              <div class="field">
+                <label for="charge-amount">Amount</label>
+                <input class="input" id="charge-amount" name="amount" type="number" min="1" step="1" inputmode="numeric" placeholder="100" required>
+              </div>
+              <div class="field">
+                <label for="charge-reason">Reason</label>
+                <input class="input" id="charge-reason" name="reason" type="text" placeholder="manual adjustment" maxlength="200" required>
+              </div>
+            </div>
+            <button class="btn btn--danger" type="submit">Charge</button>
+          </form>
+        </div>
+        <p class="inline-error" id="account-error" hidden></p>
+      </article>
+    </section>
+
+    <section class="section" id="users" aria-labelledby="users-title">
+      <div class="section-heading">
+        <div>
+          <p class="section-kicker">Directory</p>
+          <h2 id="users-title">Users <span class="count-badge" id="users-count">—</span></h2>
+          <p>Register users and rotate email addresses. Emails are unique across the directory.</p>
+        </div>
+        <button class="btn btn--ghost btn--sm" id="users-refresh" type="button">Reload users</button>
+      </div>
+
+      <article class="card">
+        <form class="inline-form inline-form--wrap" id="user-create-form" autocomplete="off">
+          <div class="field field--grow">
+            <label for="user-display-name">Display name</label>
+            <input class="input" id="user-display-name" name="display_name" type="text" maxlength="100" placeholder="Ada Lovelace" required>
+          </div>
+          <div class="field field--grow">
+            <label for="user-email">Email</label>
+            <input class="input" id="user-email" name="email" type="email" maxlength="254" placeholder="ada@example.com" required>
+          </div>
+          <button class="btn btn--primary" type="submit">Create user</button>
+        </form>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">User</th>
+                <th scope="col">Display name</th>
+                <th scope="col">Email</th>
+                <th scope="col">Version</th>
+                <th scope="col">Created</th>
+                <th scope="col" class="cell--action">Save email</th>
+              </tr>
+            </thead>
+            <tbody id="users-tbody">
+              <tr><td class="empty" colspan="6">No users loaded.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="inline-error" id="users-error" hidden></p>
+      </article>
+    </section>
+
+    <section class="section" id="teams" aria-labelledby="teams-title">
+      <div class="section-heading">
+        <div>
+          <p class="section-kicker">Directory</p>
+          <h2 id="teams-title">Teams <span class="count-badge" id="teams-count">—</span></h2>
+          <p>Create teams and rename them with optimistic concurrency via <span class="mono">expected_version</span>.</p>
+        </div>
+        <button class="btn btn--ghost btn--sm" id="teams-refresh" type="button">Reload teams</button>
+      </div>
+
+      <article class="card">
+        <form class="inline-form" id="team-create-form" autocomplete="off">
+          <div class="field field--grow">
+            <label for="team-name">Team name</label>
+            <input class="input" id="team-name" name="name" type="text" maxlength="100" placeholder="Platform" required>
+          </div>
+          <button class="btn btn--primary" type="submit">Create team</button>
+        </form>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Team</th>
+                <th scope="col">Name</th>
+                <th scope="col">Version</th>
+                <th scope="col">Created</th>
+                <th scope="col" class="cell--action">Save name</th>
+              </tr>
+            </thead>
+            <tbody id="teams-tbody">
+              <tr><td class="empty" colspan="5">No teams loaded.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="inline-error" id="teams-error" hidden></p>
+      </article>
+    </section>
+
+    <section class="section" id="memberships" aria-labelledby="memberships-title">
+      <div class="section-heading">
+        <div>
+          <p class="section-kicker">Access</p>
+          <h2 id="memberships-title">Memberships <span class="count-badge" id="memberships-count">—</span></h2>
+          <p>Join immediately, request approval, change roles, or leave. Every period keeps its history.</p>
+        </div>
+        <button class="btn btn--ghost btn--sm" id="memberships-refresh" type="button">Reload memberships</button>
+      </div>
+
+      <article class="card">
+        <form class="inline-form" id="membership-team-form" autocomplete="off">
+          <div class="field field--grow">
+            <label for="membership-team-id">Team context</label>
+            <input class="input mono" id="membership-team-id" name="team_id" type="text" list="team-options" placeholder="26-character ULID" spellcheck="false" autocapitalize="off">
+            <datalist id="team-options"></datalist>
+          </div>
+          <button class="btn btn--ghost" type="submit">Load memberships</button>
+        </form>
+
+        <div class="split-forms">
+          <form class="subcard" id="join-form" autocomplete="off">
+            <h3>Join team</h3>
+            <p class="muted small">Creates an immediately active membership with the MEMBER role.</p>
+            <div class="field">
+              <label for="join-user-id">User ID</label>
+              <input class="input mono" id="join-user-id" name="user_id" type="text" list="user-options" placeholder="User ULID" spellcheck="false" autocapitalize="off" required>
+            </div>
+            <button class="btn btn--primary" type="submit">Join</button>
+          </form>
+
+          <form class="subcard" id="request-form" autocomplete="off">
+            <h3>Request to join</h3>
+            <p class="muted small">Creates a PENDING membership that an owner or admin can approve.</p>
+            <div class="field">
+              <label for="request-user-id">User ID</label>
+              <input class="input mono" id="request-user-id" name="user_id" type="text" list="user-options" placeholder="User ULID" spellcheck="false" autocapitalize="off" required>
+            </div>
+            <button class="btn btn--primary" type="submit">Request</button>
+          </form>
+        </div>
+
+        <datalist id="user-options"></datalist>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Membership</th>
+                <th scope="col">User</th>
+                <th scope="col">Role</th>
+                <th scope="col">Status</th>
+                <th scope="col">Version</th>
+                <th scope="col">Updated</th>
+                <th scope="col" class="cell--action">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="memberships-tbody">
+              <tr><td class="empty" colspan="7">Enter a team ID to load memberships.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="inline-error" id="memberships-error" hidden></p>
+      </article>
+    </section>
+
+    <section class="section" id="audit" aria-labelledby="audit-title">
+      <div class="section-heading">
+        <div>
+          <p class="section-kicker">Append-only history</p>
+          <h2 id="audit-title">Audit</h2>
+          <p>Billing movements and request logs are read from the read-only SQLite pool, newest first.</p>
+        </div>
+      </div>
+
+      <article class="card">
+        <div class="subsection-heading">
+          <div>
+            <h3>Billing events <span class="count-badge" id="billing-count">—</span></h3>
+            <p>Filter by account or leave the account blank to read every ledger entry.</p>
+          </div>
+        </div>
+        <form class="inline-form inline-form--wrap" id="billing-form" autocomplete="off">
+          <div class="field field--grow">
+            <label for="billing-account">Account ID</label>
+            <input class="input" id="billing-account" name="account_id" type="text" placeholder="all accounts" spellcheck="false" autocapitalize="off">
+          </div>
+          <div class="field field--narrow">
+            <label for="billing-limit">Limit</label>
+            <input class="input" id="billing-limit" name="limit" type="number" min="1" max="1000" step="1" inputmode="numeric" value="50">
+          </div>
+          <button class="btn btn--ghost" type="submit">Load events</button>
+        </form>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Time</th>
+                <th scope="col">Event</th>
+                <th scope="col">Account</th>
+                <th scope="col">Amount</th>
+                <th scope="col">Reason</th>
+                <th scope="col">Request</th>
+              </tr>
+            </thead>
+            <tbody id="billing-tbody">
+              <tr><td class="empty" colspan="6">No billing events loaded.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="inline-error" id="billing-error" hidden></p>
+      </article>
+
+      <article class="card">
+        <div class="subsection-heading">
+          <div>
+            <h3>Request logs <span class="count-badge" id="logs-count">—</span></h3>
+            <p>Hot-path requests recorded asynchronously, with status, path, and latency.</p>
+          </div>
+        </div>
+        <form class="inline-form" id="logs-form" autocomplete="off">
+          <div class="field field--narrow">
+            <label for="logs-limit">Limit</label>
+            <input class="input" id="logs-limit" name="limit" type="number" min="1" max="1000" step="1" inputmode="numeric" value="50">
+          </div>
+          <button class="btn btn--ghost" type="submit">Load logs</button>
+        </form>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Time</th>
+                <th scope="col">Method</th>
+                <th scope="col">Path</th>
+                <th scope="col">Status</th>
+                <th scope="col">Latency</th>
+                <th scope="col">Account</th>
+                <th scope="col">Request</th>
+              </tr>
+            </thead>
+            <tbody id="logs-tbody">
+              <tr><td class="empty" colspan="7">No request logs loaded.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="inline-error" id="logs-error" hidden></p>
+      </article>
+    </section>
+
+    <footer class="app-footer">
+      <p>Single binary · <span class="mono">net/http</span> · SQLite WAL · Litestream v0.5 → Cloudflare R2</p>
+      <p class="muted">All dynamic values are rendered with <span class="mono">textContent</span> and DOM creation.</p>
+    </footer>
+  </main>
+
+  <div class="toast-region" id="toasts" aria-live="polite" aria-atomic="false"></div>
+</body>
+</html>
