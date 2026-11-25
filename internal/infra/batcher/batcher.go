@@ -77,6 +77,14 @@ type Batcher struct {
 	ch     chan writeEvent
 	done   chan struct{}
 	stopCh chan struct{}
+	// tokens bounds the total number of accepted-but-unwritten slots across
+	// the channel buffer and outstanding reservations. It is pre-filled with
+	// queueCapacity tokens and never closed, so returning a token never
+	// panics and never blocks.
+	tokens chan struct{}
+	// activeRes tracks reservations that have not been settled yet. Drain
+	// waits for it before closing the channel.
+	activeRes sync.WaitGroup
 
 	queueCap     atomic.Int64
 	queueLen     atomic.Int64
@@ -145,6 +153,10 @@ func New(sink port.BatchSink, opts Options) (*Batcher, error) {
 		ch:              make(chan writeEvent, capacity),
 		done:            make(chan struct{}),
 		stopCh:          make(chan struct{}),
+		tokens:          make(chan struct{}, capacity),
+	}
+	for i := 0; i < capacity; i++ {
+		batcher.tokens <- struct{}{}
 	}
 	batcher.queueCap.Store(int64(capacity))
 	go batcher.run()
@@ -154,12 +166,6 @@ func New(sink port.BatchSink, opts Options) (*Batcher, error) {
 // EnqueueBilling queues one billing event.
 func (b *Batcher) EnqueueBilling(event domain.BillingEvent) error {
 	return b.enqueue(writeEvent{kind: billingEvent, billing: event})
-}
-
-// EnqueueBillingWithQuota queues a billing event together with the quota
-// snapshot produced by the same operation so they share one transaction.
-func (b *Batcher) EnqueueBillingWithQuota(event domain.BillingEvent, quota domain.AccountQuota) error {
-	return b.enqueue(writeEvent{kind: billingWithQuotaEvent, billing: event, quota: quota})
 }
 
 // EnqueueQuotaSync queues the latest quota snapshot for an account.
@@ -176,41 +182,97 @@ func (b *Batcher) EnqueueQuotaSyncBlocking(ctx context.Context, quota domain.Acc
 	}
 	event := writeEvent{kind: quotaEvent, quota: quota}
 
-	for {
-		b.mu.RLock()
-		if b.closed {
-			b.mu.RUnlock()
-			return port.ErrQueueClosed
-		}
-		b.queueLen.Add(1)
-		select {
-		case b.ch <- event:
-			b.enqueued.Add(1)
-			b.mu.RUnlock()
-			return nil
-		default:
-			b.queueLen.Add(-1)
-		}
-		b.mu.RUnlock()
-
-		// The queue is full. Wait briefly for space, shutdown, or cancellation
-		// without holding the lifecycle lock, which Drain needs to close.
-		timer := time.NewTimer(time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-b.stopCh:
-			timer.Stop()
-			return port.ErrQueueClosed
-		case <-timer.C:
-		}
+	select {
+	case <-b.tokens:
+	case <-b.stopCh:
+		return port.ErrQueueClosed
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+
+	b.mu.RLock()
+	if b.closed {
+		b.mu.RUnlock()
+		b.tokens <- struct{}{}
+		return port.ErrQueueClosed
+	}
+	b.enqueued.Add(1)
+	b.queueLen.Add(1)
+	b.ch <- event
+	b.mu.RUnlock()
+	return nil
 }
 
 // EnqueueRequestLog queues one request log row.
 func (b *Batcher) EnqueueRequestLog(logRow domain.RequestLog) error {
 	return b.enqueue(writeEvent{kind: requestLogEvent, requestLog: logRow})
+}
+
+// Reserve allocates one slot without blocking on the writer goroutine. The
+// returned reservation guarantees space in the bounded channel for exactly one
+// event, so a caller may commit while holding a per-account lock without doing
+// disk I/O or risking a blocking send. Every reservation must be settled with
+// CommitBillingWithQuota, CommitQuotaSync, or Release.
+func (b *Batcher) Reserve() (port.WriteReservation, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if b.closed {
+		return nil, port.ErrQueueClosed
+	}
+	select {
+	case <-b.tokens:
+	default:
+		b.dropped.Add(1)
+		return nil, port.ErrQueueFull
+	}
+	b.activeRes.Add(1)
+	return &reservation{b: b}, nil
+}
+
+// reservation is one pre-allocated queue slot. Settlement is idempotent and
+// performed exactly once, either by committing one event or by releasing the
+// slot. Neither path takes the lifecycle mutex: the reserved token already
+// guarantees channel space and keeps Drain from closing the channel.
+type reservation struct {
+	b       *Batcher
+	settled atomic.Bool
+}
+
+var _ port.WriteReservation = (*reservation)(nil)
+
+// CommitBillingWithQuota commits the billing event and its quota snapshot into
+// the reserved slot.
+func (r *reservation) CommitBillingWithQuota(event domain.BillingEvent, quota domain.AccountQuota) error {
+	return r.commit(writeEvent{kind: billingWithQuotaEvent, billing: event, quota: quota})
+}
+
+// CommitQuotaSync commits one quota snapshot into the reserved slot.
+func (r *reservation) CommitQuotaSync(quota domain.AccountQuota) error {
+	return r.commit(writeEvent{kind: quotaEvent, quota: quota})
+}
+
+func (r *reservation) commit(event writeEvent) error {
+	if !r.settled.CompareAndSwap(false, true) {
+		return errors.New("batcher: reservation already settled")
+	}
+	// The reserved token guarantees len(ch) < cap(ch), and Drain waits for
+	// activeRes before closing ch, so this send neither blocks nor panics.
+	r.b.enqueued.Add(1)
+	r.b.queueLen.Add(1)
+	r.b.ch <- event
+	r.b.activeRes.Done()
+	return nil
+}
+
+// Release returns the reserved slot without enqueueing an event. It is
+// idempotent and safe to call from a defer after a failed commit attempt.
+func (r *reservation) Release() {
+	if !r.settled.CompareAndSwap(false, true) {
+		return
+	}
+	r.b.tokens <- struct{}{}
+	r.b.activeRes.Done()
 }
 
 // Stats returns a point-in-time snapshot of the queue counters. Written counts
@@ -235,24 +297,44 @@ func (b *Batcher) Stats() domain.BatcherStats {
 // channel, and later calls observe the same result. The first caller's context
 // is the drain context used for the remaining commits; a waiting caller can
 // stop early through its own ctx.Done().
+//
+// Shutdown is driven by one background closer rather than by the calling
+// goroutine, so a caller with an expired context can return without stranding
+// the writer. The closer waits for every reservation taken before the close
+// (closing the channel under an unsettled reservation would make its commit
+// panic), then always wakes the writer and closes the channel. Consequently a
+// later Drain(context.Background()) still completes after an early timeout.
 func (b *Batcher) Drain(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
 	b.mu.Lock()
-	if !b.closed {
-		b.closed = true
-		b.drainCtx = ctx
+	if b.closed {
+		b.mu.Unlock()
+		return b.waitDone(ctx)
+	}
+	b.closed = true
+	b.drainCtx = ctx
+	// Exactly one closer is started, under the lifecycle lock. closed is
+	// already true, so no new Reserve can call Add after this Wait starts.
+	// Setting drainCtx before this goroutine closes stopCh and ch makes the
+	// finish path read it without a race.
+	go func() {
+		b.activeRes.Wait()
 		// Wake the writer before closing the channel so a retry backoff cannot
 		// delay shutdown until its timer fires.
 		close(b.stopCh)
 		close(b.ch)
-	}
+	}()
 	b.mu.Unlock()
 
-	// Prefer an already-finished drain even when the caller's context is also
-	// done, so a completed Drain remains deterministic.
+	return b.waitDone(ctx)
+}
+
+// waitDone waits for the writer goroutine to finish, preferring an already
+// completed drain over the caller's cancelled context.
+func (b *Batcher) waitDone(ctx context.Context) error {
 	select {
 	case <-b.done:
 		return b.result()
@@ -281,18 +363,22 @@ func (b *Batcher) enqueue(event writeEvent) error {
 		return port.ErrQueueClosed
 	}
 
-	// Count the slot before publishing it so the writer can never decrement a
-	// not-yet-counted event and make QueueDepth transiently negative.
-	b.queueLen.Add(1)
+	// Acquiring a token reserves channel space for this event, so the send has
+	// a free slot and cannot race Drain's channel close (which waits for the
+	// lifecycle lock this RLock excludes).
 	select {
-	case b.ch <- event:
-		b.enqueued.Add(1)
-		return nil
+	case <-b.tokens:
 	default:
-		b.queueLen.Add(-1)
 		b.dropped.Add(1)
 		return port.ErrQueueFull
 	}
+
+	// Count the slot before publishing it so the writer can never decrement a
+	// not-yet-counted event and make QueueDepth transiently negative.
+	b.queueLen.Add(1)
+	b.ch <- event
+	b.enqueued.Add(1)
+	return nil
 }
 
 func (b *Batcher) run() {
@@ -351,6 +437,7 @@ func (b *Batcher) run() {
 				return
 			}
 			b.queueLen.Add(-1)
+			b.tokens <- struct{}{}
 			pending = append(pending, event)
 			b.pendingLen.Add(1)
 
@@ -403,9 +490,10 @@ func growBackoff(current, max time.Duration) time.Duration {
 }
 
 // finish commits the in-memory batch and every event still buffered in the
-// closed channel in chunks of batchSize. Each chunk gets a few short retries;
-// a chunk that still fails is recorded in the drain error and the remaining
-// chunks are attempted while the drain context is alive.
+// closed channel in chunks of batchSize. Each chunk gets a few short retries.
+// A chunk that still fails is recorded in the drain error and stops all later
+// chunks from being committed, so a later quota snapshot can never be persisted
+// while an earlier billing batch failed.
 func (b *Batcher) finish(pending []writeEvent) {
 	ctx := b.drainContext()
 	var (
@@ -413,26 +501,38 @@ func (b *Batcher) finish(pending []writeEvent) {
 		discarded bool
 	)
 
-	flush := func(batch []writeEvent) {
+	// flush returns false when a chunk could not be committed even after its
+	// bounded retries. Later chunks must then be skipped: persisting a later
+	// quota snapshot after an earlier billing batch failed would make the
+	// persisted balances move forward while a charge was lost.
+	flush := func(batch []writeEvent) bool {
 		if len(batch) == 0 {
-			return
+			return true
 		}
 		err := b.commitWithRetry(ctx, batch)
 		if err == nil {
 			b.pendingLen.Add(-int64(len(batch)))
-			return
+			return true
 		}
 		if ctx.Err() == nil {
 			b.logger.Error("batcher write failed", "err", err, "batch_len", len(batch))
 		}
 		drainErr = errors.Join(drainErr, err)
+		return false
 	}
 
-	flush(pending)
+	halted := !flush(pending)
 
 	batch := make([]writeEvent, 0, b.batchSize)
 	for event := range b.ch {
 		b.queueLen.Add(-1)
+		b.tokens <- struct{}{}
+		// Keep draining the closed channel even when halted so every buffered
+		// event is accounted for, but commit nothing after the first failure.
+		if halted {
+			discarded = true
+			continue
+		}
 		b.pendingLen.Add(1)
 		batch = append(batch, event)
 		if len(batch) < b.batchSize {
@@ -443,18 +543,25 @@ func (b *Batcher) finish(pending []writeEvent) {
 			batch = batch[:0]
 			continue
 		}
-		flush(batch)
+		halted = !flush(batch)
 		batch = batch[:0]
 	}
 	if len(batch) > 0 {
-		if ctx.Err() != nil {
+		if halted || ctx.Err() != nil {
 			discarded = true
 		} else {
 			flush(batch)
 		}
 	}
-	// Report cancellation when accepted events could not be committed.
+	// Report cancellation when accepted events could not be committed. If the
+	// drain context ended before the writer finished, report that as the
+	// outcome even when nothing was left to discard, so every waiting Drain
+	// observes the same error whether it wins the select on done or on its own
+	// context.
 	if discarded && drainErr == nil {
+		drainErr = ctx.Err()
+	}
+	if drainErr == nil {
 		drainErr = ctx.Err()
 	}
 
@@ -542,7 +649,9 @@ func buildPayload(events []writeEvent) port.BatchPayload {
 			quotaIndex = make(map[string]int)
 		}
 		if index, ok := quotaIndex[quota.AccountID]; ok {
-			payload.Quotas[index] = quota
+			if quota.Seq >= payload.Quotas[index].Seq {
+				payload.Quotas[index] = quota
+			}
 			return
 		}
 		quotaIndex[quota.AccountID] = len(payload.Quotas)

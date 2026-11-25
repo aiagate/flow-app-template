@@ -2,6 +2,8 @@ package usecase
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -317,10 +319,16 @@ func (g *fakeGuard) AcquireAndDebit(accountID, route string) (domain.HotPathDeci
 		}, domain.ErrInsufficientBalance
 	}
 	state.Balance -= cost
+	state.Seq++
+	state.UpdatedAt = time.Now().UTC()
 	g.accounts[accountID] = state
 	g.stats.Allowed++
 	return domain.HotPathDecision{
-		Allowed: true, Cost: cost, RemainingBalance: state.Balance,
+		Allowed:             true,
+		Cost:                cost,
+		RemainingBalance:    state.Balance,
+		AccountRateLimitRPM: state.RateLimitRPM,
+		Seq:                 state.Seq,
 	}, nil
 }
 
@@ -343,7 +351,7 @@ func (g *fakeGuard) Authorize(accountID, route string) (domain.HotPathDecision, 
 	}, nil
 }
 
-func (g *fakeGuard) Debit(accountID string, amount int64) (domain.HotPathDecision, error) {
+func (g *fakeGuard) Debit(accountID string, amount int64, onCommit func(domain.AccountState)) (domain.HotPathDecision, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	state, ok := g.accounts[accountID]
@@ -355,46 +363,64 @@ func (g *fakeGuard) Debit(accountID string, amount int64) (domain.HotPathDecisio
 		return domain.HotPathDecision{Allowed: false, Cost: amount, RemainingBalance: state.Balance}, domain.ErrInsufficientBalance
 	}
 	state.Balance -= amount
+	state.Seq++
+	state.UpdatedAt = time.Now().UTC()
 	g.accounts[accountID] = state
-	return domain.HotPathDecision{Allowed: true, Cost: amount, RemainingBalance: state.Balance}, nil
+	if onCommit != nil {
+		onCommit(state)
+	}
+	return domain.HotPathDecision{
+		Allowed:             true,
+		Cost:                amount,
+		RemainingBalance:    state.Balance,
+		AccountRateLimitRPM: state.RateLimitRPM,
+		Seq:                 state.Seq,
+	}, nil
 }
 
-func (g *fakeGuard) Refund(accountID string, amount int64) {
+func (g *fakeGuard) Refund(accountID string, amount int64, onCommit func(domain.AccountState)) {
 	if amount <= 0 {
 		return
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	state := g.accounts[accountID]
+	state, ok := g.accounts[accountID]
+	if !ok {
+		return
+	}
 	state.Balance += amount
+	state.Seq++
+	state.UpdatedAt = time.Now().UTC()
 	g.accounts[accountID] = state
+	if onCommit != nil {
+		onCommit(state)
+	}
 }
 
-func (g *fakeGuard) Credit(accountID string, amount int64) error {
+func (g *fakeGuard) Credit(accountID string, amount int64, onCommit func(domain.AccountState)) (domain.AccountState, error) {
 	if amount <= 0 {
-		return nil
+		return domain.AccountState{}, nil
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	state := g.accounts[accountID]
-	state.AccountID = accountID
+	state, ok := g.accounts[accountID]
+	if !ok {
+		state = domain.AccountState{AccountID: accountID, RateLimitRPM: g.config.DefaultRateLimitRPM}
+	}
+	if state.Balance > math.MaxInt64-amount {
+		return domain.AccountState{}, fmt.Errorf("%w: balance overflow", domain.ErrValidation)
+	}
 	if state.RateLimitRPM == 0 {
-		state.RateLimitRPM = 120
+		state.RateLimitRPM = g.config.DefaultRateLimitRPM
 	}
 	state.Balance += amount
+	state.Seq++
+	state.UpdatedAt = time.Now().UTC()
 	g.accounts[accountID] = state
-	return nil
-}
-
-func (g *fakeGuard) RollbackCredit(accountID string, amount int64) {
-	if amount <= 0 {
-		return
+	if onCommit != nil {
+		onCommit(state)
 	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	state := g.accounts[accountID]
-	state.Balance -= amount
-	g.accounts[accountID] = state
+	return state, nil
 }
 
 func (g *fakeGuard) GetAccountState(accountID string) (domain.AccountState, bool) {
@@ -410,6 +436,7 @@ func (g *fakeGuard) Hydrate(quotas []domain.AccountQuota) {
 	for _, quota := range quotas {
 		g.accounts[quota.AccountID] = domain.AccountState{
 			AccountID: quota.AccountID, Balance: quota.Balance, RateLimitRPM: quota.RateLimitRPM,
+			Seq: quota.Seq, UpdatedAt: quota.UpdatedAt,
 		}
 	}
 }
@@ -420,15 +447,22 @@ func (g *fakeGuard) Stats() domain.HotPathStats {
 	return g.stats
 }
 
-// fakeQueue records enqueued events so tests can assert exactly what the
-// asynchronous writer would have persisted.
+// fakeQueue records committed events so tests can assert exactly what the
+// asynchronous writer would have persisted. It models reservation lifecycle
+// with reserved/active/committed/released counters so leaks are visible.
 type fakeQueue struct {
-	mu      sync.Mutex
-	billing []domain.BillingEvent
-	quotas  []domain.AccountQuota
-	logs    []domain.RequestLog
-	err     error
-	stats   domain.BatcherStats
+	mu        sync.Mutex
+	billing   []domain.BillingEvent
+	quotas    []domain.AccountQuota
+	logs      []domain.RequestLog
+	err       error
+	commitErr error
+	stats     domain.BatcherStats
+
+	reserved  int
+	active    int
+	committed int
+	released  int
 }
 
 func (q *fakeQueue) EnqueueBilling(event domain.BillingEvent) error {
@@ -442,16 +476,15 @@ func (q *fakeQueue) EnqueueBilling(event domain.BillingEvent) error {
 	return nil
 }
 
-func (q *fakeQueue) EnqueueBillingWithQuota(event domain.BillingEvent, quota domain.AccountQuota) error {
+func (q *fakeQueue) Reserve() (port.WriteReservation, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.err != nil {
-		return q.err
+		return nil, q.err
 	}
-	q.billing = append(q.billing, event)
-	q.quotas = append(q.quotas, quota)
-	q.stats.Enqueued++
-	return nil
+	q.reserved++
+	q.active++
+	return &fakeReservation{queue: q}, nil
 }
 
 func (q *fakeQueue) EnqueueQuotaSync(quota domain.AccountQuota) error {
@@ -487,6 +520,70 @@ func (q *fakeQueue) Stats() domain.BatcherStats {
 }
 
 func (q *fakeQueue) Drain(context.Context) error { return nil }
+
+func (q *fakeQueue) reservationCounts() (reserved, active, committed, released int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.reserved, q.active, q.committed, q.released
+}
+
+// fakeReservation is one pre-reserved write slot. Exactly one of the commit
+// methods or Release settles it; a second settle is a no-op.
+type fakeReservation struct {
+	queue   *fakeQueue
+	settled bool
+}
+
+func (r *fakeReservation) CommitBillingWithQuota(event domain.BillingEvent, quota domain.AccountQuota) error {
+	q := r.queue
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if r.settled {
+		return nil
+	}
+	r.settled = true
+	q.active--
+	if q.commitErr != nil {
+		q.released++
+		return q.commitErr
+	}
+	q.billing = append(q.billing, event)
+	q.quotas = append(q.quotas, quota)
+	q.committed++
+	q.stats.Enqueued++
+	return nil
+}
+
+func (r *fakeReservation) CommitQuotaSync(quota domain.AccountQuota) error {
+	q := r.queue
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if r.settled {
+		return nil
+	}
+	r.settled = true
+	q.active--
+	if q.commitErr != nil {
+		q.released++
+		return q.commitErr
+	}
+	q.quotas = append(q.quotas, quota)
+	q.committed++
+	q.stats.Enqueued++
+	return nil
+}
+
+func (r *fakeReservation) Release() {
+	q := r.queue
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if r.settled {
+		return
+	}
+	r.settled = true
+	q.active--
+	q.released++
+}
 
 type fakeQuotas struct {
 	mu     sync.Mutex

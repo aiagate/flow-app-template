@@ -7,7 +7,10 @@ type AccountQuota struct {
 	AccountID    string
 	Balance      int64
 	RateLimitRPM int
-	UpdatedAt    time.Time
+	// Seq is the monotonic account-local sequence number of the balance update
+	// this quota snapshot reflects.
+	Seq       int64
+	UpdatedAt time.Time
 }
 
 // BillingEvent is an append-only balance movement.
@@ -73,7 +76,10 @@ type AccountState struct {
 	AccountID    string
 	Balance      int64
 	RateLimitRPM int
-	UpdatedAt    time.Time
+	// Seq is the monotonic account-local sequence number of the last committed
+	// balance update.
+	Seq       int64
+	UpdatedAt time.Time
 }
 
 // HotPathDecision reports the result of a hot-path admission attempt.
@@ -86,6 +92,13 @@ type HotPathDecision struct {
 	// RateLimitRPM is the effective requests-per-minute limit enforced for the
 	// request. Zero means unlimited.
 	RateLimitRPM int
+	// AccountRateLimitRPM is the account's effective requests-per-minute limit
+	// for quota persistence. It is distinct from RateLimitRPM, which may be a
+	// per-route override.
+	AccountRateLimitRPM int
+	// Seq is the monotonic account-local sequence number of the balance update
+	// this decision reflects.
+	Seq int64
 }
 
 // HotPathStats is a snapshot of hot-path counters.

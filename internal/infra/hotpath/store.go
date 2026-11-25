@@ -48,6 +48,11 @@ type accountBucket struct {
 	// still applies, so changing the runtime default affects lazy accounts.
 	rateLimitSet bool
 
+	// seq is the monotonic account-local sequence number of the last committed
+	// balance update. It never moves backwards, even when an older persisted
+	// snapshot is hydrated.
+	seq int64
+
 	windowStart time.Time
 	windowCount int64
 }
@@ -115,9 +120,11 @@ func (s *Store) UpdateConfig(config *domain.RuntimeConfig) {
 }
 
 // Hydrate loads persisted quotas at startup. A later Hydrate replaces the
-// balance and rate limit and resets that account's current window. Invalid
-// account IDs are skipped. Hydration never drops a persisted account: when the
-// persisted set exceeds MaxAccounts, the limit grows to fit it.
+// balance and rate limit and resets that account's current window. The
+// account-local sequence only advances, so hydrating an older snapshot can
+// never rewind it. Invalid account IDs are skipped. Hydration never drops a
+// persisted account: when the persisted set exceeds MaxAccounts, the limit
+// grows to fit it.
 func (s *Store) Hydrate(quotas []domain.AccountQuota) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -127,15 +134,22 @@ func (s *Store) Hydrate(quotas []domain.AccountQuota) {
 		if err != nil {
 			continue
 		}
+		seq := quota.Seq
+		if seq < 0 {
+			seq = 0
+		}
 		bucket := s.accounts[accountID]
 		if bucket == nil {
-			bucket = &accountBucket{}
+			bucket = &accountBucket{seq: seq}
 			s.accounts[accountID] = bucket
 		}
 		bucket.mu.Lock()
 		bucket.balance = quota.Balance
 		bucket.rateLimitRPM = quota.RateLimitRPM
 		bucket.rateLimitSet = true
+		if seq > bucket.seq {
+			bucket.seq = seq
+		}
 		bucket.windowStart = time.Time{}
 		bucket.windowCount = 0
 		bucket.mu.Unlock()
@@ -195,42 +209,52 @@ func (s *Store) AcquireAndDebit(accountID, route string) (domain.HotPathDecision
 	bucket.mu.Lock()
 	defer bucket.mu.Unlock()
 
+	acctRPM := accountEffectiveRPM(bucket, defaultRPM, s.defaultRateLimitRPM)
 	rpm := effectiveRPM(policy, hasPolicy, bucket, defaultRPM, s.defaultRateLimitRPM)
 	remaining, rateOK := bucket.consumeRate(rpm, s.clock())
 	if !rateOK {
 		s.rateLimited.Add(1)
 		return domain.HotPathDecision{
-			Allowed:          false,
-			Reason:           domain.ErrRateLimited.Error(),
-			Cost:             cost,
-			RemainingBalance: bucket.balance,
-			RemainingTokens:  0,
-			RateLimitRPM:     decisionRPM(rpm),
+			Allowed:             false,
+			Reason:              domain.ErrRateLimited.Error(),
+			Cost:                cost,
+			RemainingBalance:    bucket.balance,
+			RemainingTokens:     0,
+			RateLimitRPM:        decisionRPM(rpm),
+			AccountRateLimitRPM: acctRPM,
+			Seq:                 bucket.seq,
 		}, domain.ErrRateLimited
 	}
 
 	if bucket.balance < cost {
 		s.insufficientBalance.Add(1)
 		return domain.HotPathDecision{
-			Allowed:          false,
-			Reason:           domain.ErrInsufficientBalance.Error(),
-			Cost:             cost,
-			RemainingBalance: bucket.balance,
-			RemainingTokens:  remaining,
-			RateLimitRPM:     decisionRPM(rpm),
+			Allowed:             false,
+			Reason:              domain.ErrInsufficientBalance.Error(),
+			Cost:                cost,
+			RemainingBalance:    bucket.balance,
+			RemainingTokens:     remaining,
+			RateLimitRPM:        decisionRPM(rpm),
+			AccountRateLimitRPM: acctRPM,
+			Seq:                 bucket.seq,
 		}, domain.ErrInsufficientBalance
 	}
 
-	bucket.balance -= cost
+	if cost > 0 {
+		bucket.balance -= cost
+		bucket.seq++
+	}
 	s.totalDebited.Add(cost)
 	s.allowed.Add(1)
 
 	return domain.HotPathDecision{
-		Allowed:          true,
-		Cost:             cost,
-		RemainingBalance: bucket.balance,
-		RemainingTokens:  remaining,
-		RateLimitRPM:     decisionRPM(rpm),
+		Allowed:             true,
+		Cost:                cost,
+		RemainingBalance:    bucket.balance,
+		RemainingTokens:     remaining,
+		RateLimitRPM:        decisionRPM(rpm),
+		AccountRateLimitRPM: acctRPM,
+		Seq:                 bucket.seq,
 	}, nil
 }
 
@@ -267,39 +291,43 @@ func (s *Store) Authorize(accountID, route string) (domain.HotPathDecision, erro
 	bucket.mu.Lock()
 	defer bucket.mu.Unlock()
 
+	acctRPM := accountEffectiveRPM(bucket, defaultRPM, s.defaultRateLimitRPM)
 	rpm := effectiveRPM(policy, hasPolicy, bucket, defaultRPM, s.defaultRateLimitRPM)
 	remaining, rateOK := bucket.consumeRate(rpm, s.clock())
 	if !rateOK {
 		s.rateLimited.Add(1)
 		return domain.HotPathDecision{
-			Allowed:          false,
-			Reason:           domain.ErrRateLimited.Error(),
-			RemainingBalance: bucket.balance,
-			RemainingTokens:  0,
-			RateLimitRPM:     decisionRPM(rpm),
+			Allowed:             false,
+			Reason:              domain.ErrRateLimited.Error(),
+			RemainingBalance:    bucket.balance,
+			RemainingTokens:     0,
+			RateLimitRPM:        decisionRPM(rpm),
+			AccountRateLimitRPM: acctRPM,
+			Seq:                 bucket.seq,
 		}, domain.ErrRateLimited
 	}
 
 	s.allowed.Add(1)
 	return domain.HotPathDecision{
-		Allowed:          true,
-		RemainingBalance: bucket.balance,
-		RemainingTokens:  remaining,
-		RateLimitRPM:     decisionRPM(rpm),
+		Allowed:             true,
+		RemainingBalance:    bucket.balance,
+		RemainingTokens:     remaining,
+		RateLimitRPM:        decisionRPM(rpm),
+		AccountRateLimitRPM: acctRPM,
+		Seq:                 bucket.seq,
 	}, nil
 }
 
 // Debit deducts an explicit amount from an account without applying route
 // policy or the rate limit. Authorization is expected to have happened first.
 // It refuses unknown accounts instead of creating one with a free initial
-// balance.
-func (s *Store) Debit(accountID string, amount int64) (domain.HotPathDecision, error) {
+// balance. When onCommit is non-nil it runs synchronously while holding the
+// per-account lock, immediately after the balance and Seq update, so a
+// persisted snapshot can never move backwards relative to a concurrent debit.
+func (s *Store) Debit(accountID string, amount int64, onCommit func(domain.AccountState)) (domain.HotPathDecision, error) {
 	accountID, err := domain.ValidateAccountID(accountID)
 	if err != nil {
 		return domain.HotPathDecision{}, err
-	}
-	if amount < 0 {
-		amount = 0
 	}
 
 	bucket := s.findBucket(accountID)
@@ -309,30 +337,57 @@ func (s *Store) Debit(accountID string, amount int64) (domain.HotPathDecision, e
 	bucket.mu.Lock()
 	defer bucket.mu.Unlock()
 
+	if amount < 0 {
+		amount = 0
+	}
+	acctRPM := accountEffectiveRPM(bucket, s.configDefaultRPM(), s.defaultRateLimitRPM)
+
 	if bucket.balance < amount {
 		s.insufficientBalance.Add(1)
 		return domain.HotPathDecision{
-			Allowed:          false,
-			Reason:           domain.ErrInsufficientBalance.Error(),
-			Cost:             amount,
-			RemainingBalance: bucket.balance,
-			RemainingTokens:  -1,
+			Allowed:             false,
+			Reason:              domain.ErrInsufficientBalance.Error(),
+			Cost:                amount,
+			RemainingBalance:    bucket.balance,
+			RemainingTokens:     -1,
+			RateLimitRPM:        decisionRPM(acctRPM),
+			AccountRateLimitRPM: acctRPM,
+			Seq:                 bucket.seq,
 		}, domain.ErrInsufficientBalance
 	}
 
-	bucket.balance -= amount
-	s.totalDebited.Add(amount)
+	if amount > 0 {
+		bucket.balance -= amount
+		bucket.seq++
+		s.totalDebited.Add(amount)
+		state := domain.AccountState{
+			AccountID:    accountID,
+			Balance:      bucket.balance,
+			RateLimitRPM: acctRPM,
+			Seq:          bucket.seq,
+			UpdatedAt:    s.clock(),
+		}
+		if onCommit != nil {
+			onCommit(state)
+		}
+	}
+
 	return domain.HotPathDecision{
-		Allowed:          true,
-		Cost:             amount,
-		RemainingBalance: bucket.balance,
-		RemainingTokens:  -1,
+		Allowed:             true,
+		Cost:                amount,
+		RemainingBalance:    bucket.balance,
+		RemainingTokens:     -1,
+		RateLimitRPM:        decisionRPM(acctRPM),
+		AccountRateLimitRPM: acctRPM,
+		Seq:                 bucket.seq,
 	}, nil
 }
 
 // Refund returns a previously charged amount to an account. Non-positive
-// amounts and unknown accounts are ignored.
-func (s *Store) Refund(accountID string, amount int64) {
+// amounts and unknown accounts are ignored. When onCommit is non-nil it runs
+// synchronously while holding the per-account lock, immediately after the
+// balance and Seq update.
+func (s *Store) Refund(accountID string, amount int64, onCommit func(domain.AccountState)) {
 	if amount <= 0 {
 		return
 	}
@@ -345,72 +400,97 @@ func (s *Store) Refund(accountID string, amount int64) {
 		return
 	}
 	bucket.mu.Lock()
+	defer bucket.mu.Unlock()
+
 	bucket.balance += amount
-	bucket.mu.Unlock()
+	bucket.seq++
 	s.totalRefunded.Add(amount)
+	state := domain.AccountState{
+		AccountID:    accountID,
+		Balance:      bucket.balance,
+		RateLimitRPM: accountEffectiveRPM(bucket, s.configDefaultRPM(), s.defaultRateLimitRPM),
+		Seq:          bucket.seq,
+		UpdatedAt:    s.clock(),
+	}
+	if onCommit != nil {
+		onCommit(state)
+	}
 }
 
 // Credit adds funds to an account. Non-positive amounts are ignored. An
 // unknown account is created with exactly the credited amount; it does not
 // inherit the configured initial balance because that balance is reserved for
-// accounts admitted through the request path.
-func (s *Store) Credit(accountID string, amount int64) error {
+// accounts admitted through the request path. When onCommit is non-nil it runs
+// synchronously while holding the per-account lock, immediately after the
+// balance and Seq update.
+func (s *Store) Credit(accountID string, amount int64, onCommit func(domain.AccountState)) (domain.AccountState, error) {
 	accountID, err := domain.ValidateAccountID(accountID)
 	if err != nil {
-		return err
+		return domain.AccountState{}, err
 	}
 	if amount <= 0 {
-		return nil
+		if state, ok := s.GetAccountState(accountID); ok {
+			return state, nil
+		}
+		return domain.AccountState{}, nil
 	}
+
+	configDefault := s.configDefaultRPM()
 
 	s.mu.Lock()
-	bucket := s.accounts[accountID]
-	if bucket == nil {
-		if len(s.accounts) >= s.maxAccounts {
-			s.mu.Unlock()
-			return domain.ErrTooManyAccounts
-		}
-		bucket = &accountBucket{
-			balance:      amount,
-			rateLimitRPM: s.defaultRateLimitRPM,
-		}
-		s.accounts[accountID] = bucket
+	if bucket := s.accounts[accountID]; bucket != nil {
 		s.mu.Unlock()
-		s.totalCredited.Add(amount)
-		return nil
+		return s.creditExisting(accountID, bucket, amount, configDefault, onCommit)
 	}
+	if len(s.accounts) >= s.maxAccounts {
+		s.mu.Unlock()
+		return domain.AccountState{}, domain.ErrTooManyAccounts
+	}
+	newBucket := &accountBucket{balance: amount, seq: 1}
+	// Lock the bucket before publishing it so no concurrent reader or debit can
+	// observe the new account before onCommit has persisted the same state.
+	newBucket.mu.Lock()
+	s.accounts[accountID] = newBucket
 	s.mu.Unlock()
 
-	bucket.mu.Lock()
-	if bucket.balance > math.MaxInt64-amount {
-		bucket.mu.Unlock()
-		return fmt.Errorf("%w: balance overflow", domain.ErrValidation)
-	}
-	bucket.balance += amount
-	bucket.mu.Unlock()
 	s.totalCredited.Add(amount)
-	return nil
+	state := domain.AccountState{
+		AccountID:    accountID,
+		Balance:      newBucket.balance,
+		RateLimitRPM: accountEffectiveRPM(newBucket, configDefault, s.defaultRateLimitRPM),
+		Seq:          newBucket.seq,
+		UpdatedAt:    s.clock(),
+	}
+	if onCommit != nil {
+		onCommit(state)
+	}
+	newBucket.mu.Unlock()
+	return state, nil
 }
 
-// RollbackCredit reverses a Credit when the corresponding persistence
-// operation fails. It never creates an account. The amount is always removed,
-// even when concurrent spending has already reduced the balance below it.
-func (s *Store) RollbackCredit(accountID string, amount int64) {
-	if amount <= 0 {
-		return
-	}
-	accountID, err := domain.ValidateAccountID(accountID)
-	if err != nil {
-		return
-	}
-	bucket := s.findBucket(accountID)
-	if bucket == nil {
-		return
-	}
+// creditExisting adds amount to an already published bucket. The bucket mutex
+// is held across the balance, Seq, and onCommit update.
+func (s *Store) creditExisting(accountID string, bucket *accountBucket, amount int64, configDefault int, onCommit func(domain.AccountState)) (domain.AccountState, error) {
 	bucket.mu.Lock()
-	bucket.balance -= amount
-	bucket.mu.Unlock()
-	s.totalCredited.Add(-amount)
+	defer bucket.mu.Unlock()
+
+	if bucket.balance > math.MaxInt64-amount {
+		return domain.AccountState{}, fmt.Errorf("%w: balance overflow", domain.ErrValidation)
+	}
+	bucket.balance += amount
+	bucket.seq++
+	s.totalCredited.Add(amount)
+	state := domain.AccountState{
+		AccountID:    accountID,
+		Balance:      bucket.balance,
+		RateLimitRPM: accountEffectiveRPM(bucket, configDefault, s.defaultRateLimitRPM),
+		Seq:          bucket.seq,
+		UpdatedAt:    s.clock(),
+	}
+	if onCommit != nil {
+		onCommit(state)
+	}
+	return state, nil
 }
 
 // GetAccountState reports the in-memory state of a known account. It never
@@ -425,18 +505,11 @@ func (s *Store) GetAccountState(accountID string) (domain.AccountState, bool) {
 
 	bucket.mu.Lock()
 	defer bucket.mu.Unlock()
-	rateLimitRPM := bucket.rateLimitRPM
-	if !bucket.rateLimitSet {
-		if config := s.config.Load(); config != nil && config.DefaultRateLimitRPM > 0 {
-			rateLimitRPM = config.DefaultRateLimitRPM
-		} else {
-			rateLimitRPM = s.defaultRateLimitRPM
-		}
-	}
 	return domain.AccountState{
 		AccountID:    accountID,
 		Balance:      bucket.balance,
-		RateLimitRPM: rateLimitRPM,
+		RateLimitRPM: accountEffectiveRPM(bucket, s.configDefaultRPM(), s.defaultRateLimitRPM),
+		Seq:          bucket.seq,
 	}, true
 }
 
@@ -451,22 +524,15 @@ func (s *Store) SnapshotQuotas(updatedAt time.Time) []domain.AccountQuota {
 	}
 	s.mu.RUnlock()
 
-	config := s.config.Load()
+	configDefault := s.configDefaultRPM()
 	quotas := make([]domain.AccountQuota, 0, len(buckets))
 	for accountID, bucket := range buckets {
 		bucket.mu.Lock()
-		rateLimitRPM := bucket.rateLimitRPM
-		if !bucket.rateLimitSet {
-			if config != nil && config.DefaultRateLimitRPM > 0 {
-				rateLimitRPM = config.DefaultRateLimitRPM
-			} else {
-				rateLimitRPM = s.defaultRateLimitRPM
-			}
-		}
 		quotas = append(quotas, domain.AccountQuota{
 			AccountID:    accountID,
 			Balance:      bucket.balance,
-			RateLimitRPM: rateLimitRPM,
+			RateLimitRPM: accountEffectiveRPM(bucket, configDefault, s.defaultRateLimitRPM),
+			Seq:          bucket.seq,
 			UpdatedAt:    updatedAt,
 		})
 		bucket.mu.Unlock()
@@ -535,6 +601,30 @@ func decisionRPM(rpm int) int {
 	return rpm
 }
 
+// configDefaultRPM returns the runtime default rate limit, or zero when no
+// snapshot is installed.
+func (s *Store) configDefaultRPM() int {
+	if config := s.config.Load(); config != nil {
+		return config.DefaultRateLimitRPM
+	}
+	return 0
+}
+
+// accountEffectiveRPM returns the account's own effective rate limit, ignoring
+// any per-route override. The caller must hold bucket.mu.
+func accountEffectiveRPM(bucket *accountBucket, configDefault, storeDefault int) int {
+	if bucket.rateLimitSet {
+		return bucket.rateLimitRPM
+	}
+	if configDefault > 0 {
+		return configDefault
+	}
+	return storeDefault
+}
+
+// effectiveRPM returns the rate limit enforced for one request: a positive
+// per-route override wins, otherwise the account's own effective limit applies.
+// The caller must hold bucket.mu.
 func effectiveRPM(
 	policy domain.RoutePolicy,
 	hasPolicy bool,
@@ -545,13 +635,7 @@ func effectiveRPM(
 	if hasPolicy && policy.RateLimitRPM > 0 {
 		return policy.RateLimitRPM
 	}
-	if bucket.rateLimitSet {
-		return bucket.rateLimitRPM
-	}
-	if configDefault > 0 {
-		return configDefault
-	}
-	return storeDefault
+	return accountEffectiveRPM(bucket, configDefault, storeDefault)
 }
 
 // consumeRate advances the fixed one-minute window. It returns the remaining

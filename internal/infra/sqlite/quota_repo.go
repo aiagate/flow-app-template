@@ -16,7 +16,7 @@ type quotaRepo struct {
 
 func (r *quotaRepo) ListAll(ctx context.Context) ([]domain.AccountQuota, error) {
 	rows, err := r.store.ReadDB.QueryContext(ctx, `
-		SELECT account_id, balance, rate_limit_rpm, updated_at
+		SELECT account_id, balance, rate_limit_rpm, seq, updated_at
 		FROM account_quotas
 		ORDER BY account_id ASC`)
 	if err != nil {
@@ -40,7 +40,7 @@ func (r *quotaRepo) ListAll(ctx context.Context) ([]domain.AccountQuota, error) 
 
 func (r *quotaRepo) GetByAccountID(ctx context.Context, accountID string) (domain.AccountQuota, error) {
 	quota, err := scanQuota(r.store.ReadDB.QueryRowContext(ctx, `
-		SELECT account_id, balance, rate_limit_rpm, updated_at
+		SELECT account_id, balance, rate_limit_rpm, seq, updated_at
 		FROM account_quotas
 		WHERE account_id = ?`, accountID))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -57,9 +57,10 @@ func scanQuota(row scanner) (domain.AccountQuota, error) {
 		accountID string
 		balance   int64
 		rateLimit int64
+		seq       int64
 		updated   string
 	)
-	if err := row.Scan(&accountID, &balance, &rateLimit, &updated); err != nil {
+	if err := row.Scan(&accountID, &balance, &rateLimit, &seq, &updated); err != nil {
 		return domain.AccountQuota{}, err
 	}
 	updatedAt, err := parseTimestamp("account_quota.updated_at", updated)
@@ -70,6 +71,7 @@ func scanQuota(row scanner) (domain.AccountQuota, error) {
 		AccountID:    accountID,
 		Balance:      balance,
 		RateLimitRPM: int(rateLimit),
+		Seq:          seq,
 		UpdatedAt:    updatedAt,
 	}, nil
 }

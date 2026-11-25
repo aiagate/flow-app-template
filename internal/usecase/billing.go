@@ -93,83 +93,97 @@ func (b *BillingUseCase) GetAccount(ctx context.Context, accountID string) (Acco
 	}, nil
 }
 
-// CreditAccount adds balance immediately and queues the billing event plus the
-// latest quota snapshot for the asynchronous group commit.
+// CreditAccount adds balance immediately and commits the billing event plus the
+// post-mutation quota snapshot through a pre-reserved write slot. The slot is
+// acquired first so a full queue rejects the request before any balance moves.
 func (b *BillingUseCase) CreditAccount(ctx context.Context, input CreditAccountInput) (AccountView, error) {
 	accountID, reason, err := validateLedgerInput(input.AccountID, input.Amount, input.Reason)
 	if err != nil {
 		return AccountView{}, err
 	}
 
-	if err := b.guard.Credit(accountID, input.Amount); err != nil {
+	res, err := b.queue.Reserve()
+	if err != nil {
 		return AccountView{}, ClassifyError(err)
 	}
-	state, ok := b.guard.GetAccountState(accountID)
-	if !ok {
-		b.guard.RollbackCredit(accountID, input.Amount)
-		return AccountView{}, NewError(CodeUnexpected, "account state is unavailable")
-	}
+	defer res.Release()
 
-	now := time.Now().UTC()
-	view := AccountView{
-		AccountID:    state.AccountID,
-		Balance:      state.Balance,
-		RateLimitRPM: state.RateLimitRPM,
-		UpdatedAt:    now,
+	var commitErr error
+	state, err := b.guard.Credit(accountID, input.Amount, func(st domain.AccountState) {
+		commitErr = res.CommitBillingWithQuota(
+			domain.BillingEvent{
+				ID:         domain.NewEventID(),
+				AccountID:  accountID,
+				Amount:     input.Amount,
+				Reason:     reason,
+				RequestID:  input.RequestID,
+				OccurredAt: st.UpdatedAt,
+			},
+			domain.AccountQuota{
+				AccountID:    accountID,
+				Balance:      st.Balance,
+				RateLimitRPM: st.RateLimitRPM,
+				Seq:          st.Seq,
+				UpdatedAt:    st.UpdatedAt,
+			},
+		)
+	})
+	if err != nil {
+		return AccountView{}, ClassifyError(err)
 	}
-	if err := b.enqueueMovement(domain.BillingEvent{
-		ID:         domain.NewEventID(),
-		AccountID:  accountID,
-		Amount:     input.Amount,
-		Reason:     reason,
-		RequestID:  input.RequestID,
-		OccurredAt: now,
-	}, view); err != nil {
-		// Undo the in-memory credit so the caller can safely retry.
-		b.guard.RollbackCredit(accountID, input.Amount)
-		return AccountView{}, err
+	if commitErr != nil {
+		return AccountView{}, ClassifyError(commitErr)
 	}
-	return view, nil
+	return accountViewFromState(state), nil
 }
 
 // ChargeAccount performs the single explicit debit for the charge route. The
 // middleware for that route only authorizes and rate-limits, so the amount is
-// never deducted twice.
+// never deducted twice. The write slot is reserved before the debit so a full
+// queue never moves balance.
 func (b *BillingUseCase) ChargeAccount(ctx context.Context, input ChargeAccountInput) (AccountView, error) {
 	accountID, reason, err := validateLedgerInput(input.AccountID, input.Amount, input.Reason)
 	if err != nil {
 		return AccountView{}, err
 	}
 
-	_, err = b.guard.Debit(accountID, input.Amount)
+	res, err := b.queue.Reserve()
 	if err != nil {
 		return AccountView{}, ClassifyError(err)
 	}
-	state, ok := b.guard.GetAccountState(accountID)
-	if !ok {
-		b.guard.Refund(accountID, input.Amount)
-		return AccountView{}, NewError(CodeUnexpected, "account state is unavailable")
-	}
+	defer res.Release()
 
-	now := time.Now().UTC()
-	view := AccountView{
-		AccountID:    state.AccountID,
-		Balance:      state.Balance,
-		RateLimitRPM: state.RateLimitRPM,
-		UpdatedAt:    now,
+	var (
+		committed domain.AccountState
+		commitErr error
+	)
+	_, err = b.guard.Debit(accountID, input.Amount, func(st domain.AccountState) {
+		committed = st
+		commitErr = res.CommitBillingWithQuota(
+			domain.BillingEvent{
+				ID:         domain.NewEventID(),
+				AccountID:  accountID,
+				Amount:     -input.Amount,
+				Reason:     reason,
+				RequestID:  input.RequestID,
+				OccurredAt: st.UpdatedAt,
+			},
+			domain.AccountQuota{
+				AccountID:    accountID,
+				Balance:      st.Balance,
+				RateLimitRPM: st.RateLimitRPM,
+				Seq:          st.Seq,
+				UpdatedAt:    st.UpdatedAt,
+			},
+		)
+	})
+	if err != nil {
+		return AccountView{}, ClassifyError(err)
 	}
-	if err := b.enqueueMovement(domain.BillingEvent{
-		ID:         domain.NewEventID(),
-		AccountID:  accountID,
-		Amount:     -input.Amount,
-		Reason:     reason,
-		RequestID:  input.RequestID,
-		OccurredAt: now,
-	}, view); err != nil {
-		b.guard.Refund(accountID, input.Amount)
-		return AccountView{}, err
+	if commitErr != nil {
+		return AccountView{}, ClassifyError(commitErr)
 	}
-	return view, nil
+	return accountViewFromState(committed), nil
 }
 
 // ListBillingEvents reads append-only ledger history, optionally filtered by
@@ -199,16 +213,13 @@ func (b *BillingUseCase) ListRequestLogs(ctx context.Context, limit int) ([]doma
 	return logs, nil
 }
 
-func (b *BillingUseCase) enqueueMovement(event domain.BillingEvent, view AccountView) error {
-	if err := b.queue.EnqueueBillingWithQuota(event, domain.AccountQuota{
-		AccountID:    view.AccountID,
-		Balance:      view.Balance,
-		RateLimitRPM: view.RateLimitRPM,
-		UpdatedAt:    view.UpdatedAt,
-	}); err != nil {
-		return ClassifyError(err)
+func accountViewFromState(state domain.AccountState) AccountView {
+	return AccountView{
+		AccountID:    state.AccountID,
+		Balance:      state.Balance,
+		RateLimitRPM: state.RateLimitRPM,
+		UpdatedAt:    state.UpdatedAt,
 	}
-	return nil
 }
 
 func validateLedgerInput(accountID string, amount int64, reason string) (string, string, error) {

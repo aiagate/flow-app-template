@@ -252,12 +252,14 @@ func (s *Store) WriteBatch(ctx context.Context, payload port.BatchPayload) error
 
 		if len(quotas) > 0 {
 			stmt, err := tx.PrepareContext(ctx, `
-				INSERT INTO account_quotas (account_id, balance, rate_limit_rpm, updated_at)
-				VALUES (?, ?, ?, ?)
+				INSERT INTO account_quotas (account_id, balance, rate_limit_rpm, seq, updated_at)
+				VALUES (?, ?, ?, ?, ?)
 				ON CONFLICT(account_id) DO UPDATE SET
 					balance = excluded.balance,
 					rate_limit_rpm = excluded.rate_limit_rpm,
-					updated_at = excluded.updated_at`)
+					seq = excluded.seq,
+					updated_at = excluded.updated_at
+				WHERE excluded.seq >= account_quotas.seq`)
 			if err != nil {
 				return fmt.Errorf("prepare quota upsert: %w", err)
 			}
@@ -267,6 +269,7 @@ func (s *Store) WriteBatch(ctx context.Context, payload port.BatchPayload) error
 					quota.AccountID,
 					quota.Balance,
 					quota.RateLimitRPM,
+					quota.Seq,
 					formatTimestamp(quota.UpdatedAt),
 				); err != nil {
 					return mapWriteError("upsert account quota", err)
@@ -301,6 +304,10 @@ func (s *Store) WriteBatch(ctx context.Context, payload port.BatchPayload) error
 	})
 }
 
+// dedupeQuotas keeps one snapshot per account. When a payload carries several
+// snapshots for the same account, the highest Seq wins regardless of slice
+// order, so a delayed lower-Seq snapshot cannot roll the persisted balance
+// backward.
 func dedupeQuotas(quotas []domain.AccountQuota) []domain.AccountQuota {
 	if len(quotas) < 2 {
 		return quotas
@@ -309,7 +316,9 @@ func dedupeQuotas(quotas []domain.AccountQuota) []domain.AccountQuota {
 	deduped := make([]domain.AccountQuota, 0, len(quotas))
 	for _, quota := range quotas {
 		if existing, ok := index[quota.AccountID]; ok {
-			deduped[existing] = quota
+			if quota.Seq >= deduped[existing].Seq {
+				deduped[existing] = quota
+			}
 			continue
 		}
 		index[quota.AccountID] = len(deduped)

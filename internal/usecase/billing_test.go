@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -85,15 +86,25 @@ func TestCreditAccountEnqueuesMovementAndQuota(t *testing.T) {
 	if event.ID.IsZero() {
 		t.Fatal("billing event has a zero ID")
 	}
-	if len(queue.quotas) != 1 || queue.quotas[0].Balance != 150 || queue.quotas[0].AccountID != "acct" {
+	if len(queue.quotas) != 1 {
 		t.Fatalf("quota syncs = %+v", queue.quotas)
 	}
-	if state, _ := guard.GetAccountState("acct"); state.Balance != 150 {
-		t.Fatalf("guard balance = %d", state.Balance)
+	quota := queue.quotas[0]
+	if quota.AccountID != "acct" || quota.Balance != 150 || quota.Seq != 1 {
+		t.Fatalf("quota = %+v, want exact post-credit balance and seq", quota)
+	}
+	if !quota.UpdatedAt.Equal(event.OccurredAt) {
+		t.Fatalf("quota updated_at %s != event occurred_at %s", quota.UpdatedAt, event.OccurredAt)
+	}
+	if state, _ := guard.GetAccountState("acct"); state.Balance != 150 || state.Seq != 1 {
+		t.Fatalf("guard state = %+v", state)
+	}
+	if _, active, committed, _ := queue.reservationCounts(); active != 0 || committed != 1 {
+		t.Fatalf("reservations active=%d committed=%d", active, committed)
 	}
 }
 
-func TestCreditAccountRollsBackWhenTheQueueRejects(t *testing.T) {
+func TestCreditAccountQueueFullLeavesBalanceUntouched(t *testing.T) {
 	ctx := context.Background()
 	billing, guard, queue, _, _ := newBillingForTest(map[string]int64{"acct": 100})
 	queue.err = port.ErrQueueFull
@@ -103,10 +114,50 @@ func TestCreditAccountRollsBackWhenTheQueueRejects(t *testing.T) {
 
 	state, _ := guard.GetAccountState("acct")
 	if state.Balance != 100 {
-		t.Fatalf("balance = %d, want the credit rolled back to 100", state.Balance)
+		t.Fatalf("balance = %d, want the credit rejected before mutation", state.Balance)
+	}
+	if state.Seq != 0 {
+		t.Fatalf("seq = %d, want no mutation", state.Seq)
 	}
 	if len(queue.billing) != 0 || len(queue.quotas) != 0 {
 		t.Fatalf("failed credit persisted billing=%d quotas=%d", len(queue.billing), len(queue.quotas))
+	}
+	if reserved, active, _, _ := queue.reservationCounts(); reserved != 0 || active != 0 {
+		t.Fatalf("reservations reserved=%d active=%d, want none", reserved, active)
+	}
+}
+
+func TestCreditAccountOverflowReleasesTheReservation(t *testing.T) {
+	ctx := context.Background()
+	billing, guard, queue, _, _ := newBillingForTest(map[string]int64{"acct": math.MaxInt64 - 1})
+	reserved := int64(math.MaxInt64 - 1)
+
+	_, err := billing.CreditAccount(ctx, CreditAccountInput{AccountID: "acct", Amount: 5, Reason: "overflow"})
+	assertCode(t, err, CodeValidation)
+
+	if state, _ := guard.GetAccountState("acct"); state.Balance != reserved {
+		t.Fatalf("balance = %d, want %d", state.Balance, reserved)
+	}
+	if len(queue.billing) != 0 || len(queue.quotas) != 0 {
+		t.Fatalf("overflowed credit committed billing=%d quotas=%d", len(queue.billing), len(queue.quotas))
+	}
+	if _, active, committed, released := queue.reservationCounts(); active != 0 || committed != 0 || released != 1 {
+		t.Fatalf("reservations active=%d committed=%d released=%d", active, committed, released)
+	}
+}
+
+func TestCreditAccountCommitFailureReleasesTheReservation(t *testing.T) {
+	ctx := context.Background()
+	billing, _, queue, _, _ := newBillingForTest(map[string]int64{"acct": 100})
+	queue.commitErr = port.ErrQueueClosed
+
+	_, err := billing.CreditAccount(ctx, CreditAccountInput{AccountID: "acct", Amount: 25, Reason: "top-up"})
+	assertCode(t, err, CodeServiceUnavailable)
+	if len(queue.billing) != 0 || len(queue.quotas) != 0 {
+		t.Fatalf("failed commit persisted billing=%d quotas=%d", len(queue.billing), len(queue.quotas))
+	}
+	if _, active, _, _ := queue.reservationCounts(); active != 0 {
+		t.Fatalf("active reservations = %d, want 0", active)
 	}
 }
 
@@ -129,8 +180,15 @@ func TestChargeAccountDebitsExactlyOnce(t *testing.T) {
 	if len(queue.billing) != 1 || queue.billing[0].Amount != -30 {
 		t.Fatalf("billing events = %+v", queue.billing)
 	}
-	if len(queue.quotas) != 1 || queue.quotas[0].Balance != 70 {
+	if len(queue.quotas) != 1 {
 		t.Fatalf("quota syncs = %+v", queue.quotas)
+	}
+	quota := queue.quotas[0]
+	if quota.Balance != 70 || quota.Seq != 1 {
+		t.Fatalf("quota = %+v, want exact post-charge balance and seq", quota)
+	}
+	if _, active, committed, _ := queue.reservationCounts(); active != 0 || committed != 1 {
+		t.Fatalf("reservations active=%d committed=%d", active, committed)
 	}
 }
 
@@ -166,7 +224,7 @@ func TestChargeAccountInsufficientBalanceAndValidation(t *testing.T) {
 	assertCode(t, err, CodeValidation)
 }
 
-func TestChargeAccountRefundsWhenTheQueueRejects(t *testing.T) {
+func TestChargeAccountQueueFullLeavesBalanceUntouched(t *testing.T) {
 	ctx := context.Background()
 	billing, guard, queue, _, _ := newBillingForTest(map[string]int64{"acct": 50})
 	queue.err = port.ErrQueueClosed
@@ -176,7 +234,79 @@ func TestChargeAccountRefundsWhenTheQueueRejects(t *testing.T) {
 
 	state, _ := guard.GetAccountState("acct")
 	if state.Balance != 50 {
-		t.Fatalf("balance = %d, want the charge refunded to 50", state.Balance)
+		t.Fatalf("balance = %d, want the charge rejected before mutation", state.Balance)
+	}
+	if state.Seq != 0 {
+		t.Fatalf("seq = %d, want no mutation", state.Seq)
+	}
+	if len(queue.billing) != 0 || len(queue.quotas) != 0 {
+		t.Fatalf("failed charge persisted billing=%d quotas=%d", len(queue.billing), len(queue.quotas))
+	}
+	if reserved, active, _, _ := queue.reservationCounts(); reserved != 0 || active != 0 {
+		t.Fatalf("reservations reserved=%d active=%d, want none", reserved, active)
+	}
+}
+
+func TestChargeAccountErrorsReleaseTheReservation(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("insufficient balance", func(t *testing.T) {
+		billing, guard, queue, _, _ := newBillingForTest(map[string]int64{"acct": 10})
+
+		_, err := billing.ChargeAccount(ctx, ChargeAccountInput{AccountID: "acct", Amount: 11, Reason: "too much"})
+		assertCode(t, err, CodeInsufficientBalance)
+
+		if state, _ := guard.GetAccountState("acct"); state.Balance != 10 || state.Seq != 0 {
+			t.Fatalf("state = %+v, want no mutation", state)
+		}
+		if len(queue.billing) != 0 || len(queue.quotas) != 0 {
+			t.Fatalf("failed debit committed billing=%d quotas=%d", len(queue.billing), len(queue.quotas))
+		}
+		if _, active, committed, released := queue.reservationCounts(); active != 0 || committed != 0 || released != 1 {
+			t.Fatalf("reservations active=%d committed=%d released=%d", active, committed, released)
+		}
+	})
+
+	t.Run("unknown account", func(t *testing.T) {
+		billing, _, queue, _, _ := newBillingForTest(map[string]int64{"acct": 10})
+
+		_, err := billing.ChargeAccount(ctx, ChargeAccountInput{AccountID: "missing", Amount: 1, Reason: "charge"})
+		assertCode(t, err, CodeNotFound)
+
+		if len(queue.billing) != 0 || len(queue.quotas) != 0 {
+			t.Fatalf("failed debit committed billing=%d quotas=%d", len(queue.billing), len(queue.quotas))
+		}
+		if _, active, committed, released := queue.reservationCounts(); active != 0 || committed != 0 || released != 1 {
+			t.Fatalf("reservations active=%d committed=%d released=%d", active, committed, released)
+		}
+	})
+}
+
+func TestLedgerQuotaTracksMonotonicSeq(t *testing.T) {
+	ctx := context.Background()
+	billing, guard, queue, _, _ := newBillingForTest(map[string]int64{"acct": 100})
+
+	if _, err := billing.CreditAccount(ctx, CreditAccountInput{AccountID: "acct", Amount: 50, Reason: "top-up"}); err != nil {
+		t.Fatalf("CreditAccount: %v", err)
+	}
+	if _, err := billing.ChargeAccount(ctx, ChargeAccountInput{AccountID: "acct", Amount: 30, Reason: "charge"}); err != nil {
+		t.Fatalf("ChargeAccount: %v", err)
+	}
+
+	if len(queue.quotas) != 2 {
+		t.Fatalf("quota syncs = %+v", queue.quotas)
+	}
+	if queue.quotas[0].Balance != 150 || queue.quotas[0].Seq != 1 {
+		t.Fatalf("credit quota = %+v", queue.quotas[0])
+	}
+	if queue.quotas[1].Balance != 120 || queue.quotas[1].Seq != 2 {
+		t.Fatalf("charge quota = %+v", queue.quotas[1])
+	}
+	if state, _ := guard.GetAccountState("acct"); state.Balance != 120 || state.Seq != 2 {
+		t.Fatalf("guard state = %+v", state)
+	}
+	if _, active, committed, _ := queue.reservationCounts(); active != 0 || committed != 2 {
+		t.Fatalf("reservations active=%d committed=%d", active, committed)
 	}
 }
 

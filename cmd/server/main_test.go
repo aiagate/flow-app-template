@@ -10,12 +10,16 @@ import (
 	"net/http"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aiagate/flow-app-template/internal/contract/port"
+	"github.com/aiagate/flow-app-template/internal/domain"
+	"github.com/aiagate/flow-app-template/internal/infra/batcher"
 	"github.com/aiagate/flow-app-template/internal/infra/config"
 	"github.com/aiagate/flow-app-template/internal/infra/hotpath"
 	"github.com/aiagate/flow-app-template/internal/infra/sqlite"
@@ -718,7 +722,7 @@ func TestShutdownWithTimeoutsPersistsFinalSnapshotWithIndependentBudgets(t *test
 
 	// Mutate only the hot path so the final SnapshotQuotas is the sole writer
 	// of this balance.
-	if err := app.hot.Credit("final", 777); err != nil {
+	if _, err := app.hot.Credit("final", 777, nil); err != nil {
 		t.Fatalf("seed hot path: %v", err)
 	}
 
@@ -758,5 +762,599 @@ func TestShutdownWithTimeoutsPersistsFinalSnapshotWithIndependentBudgets(t *test
 	}
 	if balance != 777 {
 		t.Fatalf("persisted final balance = %d, want 777", balance)
+	}
+}
+
+// TestEndToEndQueueFullRejectsMeteredRouteWithoutLosingBillingHistory proves
+// that a saturated write queue rejects a metered request before the hot path
+// debits it, and that the rejection neither records a billing event nor drops
+// one that should have been recorded.
+func TestEndToEndQueueFullRejectsMeteredRouteWithoutLosingBillingHistory(t *testing.T) {
+	const initialBalance = int64(100)
+
+	cfg := baseTestConfig(t)
+	cfg.DefaultInitialBalance = initialBalance
+	cfg.DefaultRateLimitRPM = 1000
+
+	app, err := newApp(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	if err := app.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	client := newE2EClient(t, app, cfg.AdminAPIKey)
+
+	// Hold every batcher slot so the next metered request cannot reserve one.
+	held := make([]port.WriteReservation, 0, batcher.QueueCapacity)
+	defer func() {
+		for _, res := range held {
+			res.Release()
+		}
+	}()
+	for len(held) < batcher.QueueCapacity {
+		res, err := app.writer.Reserve()
+		if err != nil {
+			t.Fatalf("Reserve %d/%d: %v", len(held), batcher.QueueCapacity, err)
+		}
+		held = append(held, res)
+	}
+	if _, err := app.writer.Reserve(); !errors.Is(err, port.ErrQueueFull) {
+		t.Fatalf("Reserve with a full queue error = %v, want ErrQueueFull", err)
+	}
+
+	before := client.mustStatus(http.MethodGet, "/api/v1/accounts/default", nil, "", http.StatusOK)
+	if before.Body["balance"] != float64(initialBalance) {
+		t.Fatalf("balance before rejection = %v, want %d", before.Body["balance"], initialBalance)
+	}
+
+	rejected := client.mustDo(http.MethodGet, "/api/v1/users", nil, "", "")
+	if rejected.Status != http.StatusServiceUnavailable {
+		t.Fatalf("metered status under saturation = %d, want %d; body = %s",
+			rejected.Status, http.StatusServiceUnavailable, rejected.Raw)
+	}
+	if code, _ := object(t, rejected.Body, "error")["code"].(string); code != "SERVICE_UNAVAILABLE" {
+		t.Fatalf("metered rejection code = %q, want SERVICE_UNAVAILABLE", code)
+	}
+
+	// Admission failed before the debit and before any event was enqueued:
+	// the balance is untouched and the ledger has no phantom row.
+	afterRejection := client.mustStatus(http.MethodGet, "/api/v1/accounts/default", nil, "", http.StatusOK)
+	if afterRejection.Body["balance"] != float64(initialBalance) {
+		t.Fatalf("balance after rejection = %v, want %d", afterRejection.Body["balance"], initialBalance)
+	}
+
+	var rejectedEvents int64
+	if err := app.store.ReadDB.QueryRow(
+		`SELECT COUNT(*) FROM billing_events WHERE account_id = ?`, defaultAccountID,
+	).Scan(&rejectedEvents); err != nil {
+		t.Fatalf("count billing events after rejection: %v", err)
+	}
+	if rejectedEvents != 0 {
+		t.Fatalf("billing events after rejected request = %d, want 0", rejectedEvents)
+	}
+
+	// Return the slots, then the same metered route must succeed and bill once.
+	for _, res := range held {
+		res.Release()
+	}
+	held = held[:0]
+
+	allowed := client.mustStatus(http.MethodGet, "/api/v1/users", nil, "", http.StatusOK)
+	if got := allowed.Header.Get("X-Account-Balance"); got != fmt.Sprintf("%d", initialBalance-1) {
+		t.Fatalf("balance header after allowed request = %q, want %d", got, initialBalance-1)
+	}
+	afterAllowed := client.mustStatus(http.MethodGet, "/api/v1/accounts/default", nil, "", http.StatusOK)
+	if afterAllowed.Body["balance"] != float64(initialBalance-1) {
+		t.Fatalf("balance after allowed request = %v, want %d", afterAllowed.Body["balance"], initialBalance-1)
+	}
+
+	shutdownTestApp(t, app)
+
+	reopened, err := sqlite.Open(context.Background(), cfg.DBPath, cfg.DBReadConns)
+	if err != nil {
+		t.Fatalf("reopen sqlite: %v", err)
+	}
+	defer reopened.Close()
+
+	quota, err := sqlite.NewQuotaRepository(reopened).GetByAccountID(context.Background(), defaultAccountID)
+	if err != nil {
+		t.Fatalf("GetByAccountID: %v", err)
+	}
+	events, err := sqlite.NewAuditQuery(reopened).ListBillingEvents(context.Background(), defaultAccountID, 1000)
+	if err != nil {
+		t.Fatalf("ListBillingEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("persisted billing events = %d, want exactly 1", len(events))
+	}
+	var sum int64
+	for _, event := range events {
+		sum += event.Amount
+	}
+	if sum != -1 {
+		t.Fatalf("billing event sum = %d, want -1", sum)
+	}
+	if want := initialBalance + sum; quota.Balance != want {
+		t.Fatalf("persisted balance = %d, want initialBalance + SUM(events) = %d", quota.Balance, want)
+	}
+	if quota.Seq != 1 {
+		t.Fatalf("persisted seq = %d, want 1", quota.Seq)
+	}
+}
+
+// TestEndToEndConcurrentChargesAndRestartPreserveMonotonicSeqAndBalance drives
+// concurrent explicit charges and metered pre-debits, inspects SQLite before a
+// clean shutdown to simulate a crash, then restarts on the same file and proves
+// that hydration restores the persisted sequence instead of freezing updates.
+func TestEndToEndConcurrentChargesAndRestartPreserveMonotonicSeqAndBalance(t *testing.T) {
+	const (
+		initialBalance = int64(1000)
+		chargeCount    = 20
+		chargeAmount   = int64(10)
+		meteredCount   = 20
+		requestCost    = int64(1)
+	)
+
+	cfg := baseTestConfig(t)
+	cfg.DefaultInitialBalance = initialBalance
+	// 40 requests in one burst stay well below the per-minute limit.
+	cfg.DefaultRateLimitRPM = 120
+
+	first, err := newApp(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("newApp first: %v", err)
+	}
+	if err := first.Start(); err != nil {
+		t.Fatalf("Start first: %v", err)
+	}
+
+	client := newE2EClient(t, first, cfg.AdminAPIKey)
+
+	var (
+		wg       sync.WaitGroup
+		failures = make(chan error, chargeCount+meteredCount)
+	)
+	for range chargeCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			response, err := client.do(http.MethodPost, "/api/v1/accounts/default/charge", map[string]any{
+				"amount": chargeAmount, "reason": "concurrent-charge",
+			}, "", "")
+			if err != nil {
+				failures <- err
+				return
+			}
+			if response.Status != http.StatusOK {
+				failures <- fmt.Errorf("charge status = %d: %s", response.Status, response.Raw)
+			}
+		}()
+	}
+	for range meteredCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			response, err := client.do(http.MethodGet, "/api/v1/users", nil, "", "")
+			if err != nil {
+				failures <- err
+				return
+			}
+			if response.Status != http.StatusOK {
+				failures <- fmt.Errorf("metered status = %d: %s", response.Status, response.Raw)
+			}
+		}()
+	}
+	wg.Wait()
+	close(failures)
+	for failure := range failures {
+		t.Error(failure)
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	// Wait until the writer has committed every accepted event. This inspects
+	// SQLite while the process is still running, simulating a crash that never
+	// reaches the final SnapshotQuotas/Shutdown path.
+	quotaRepo := sqlite.NewQuotaRepository(first.store)
+	audit := sqlite.NewAuditQuery(first.store)
+	wantEvents := chargeCount + meteredCount
+	wantSum := -(chargeAmount*chargeCount + requestCost*meteredCount)
+	deadline := time.Now().Add(10 * time.Second)
+	var persisted []domain.BillingEvent
+	for {
+		stats := first.writer.Stats()
+		events, err := audit.ListBillingEvents(context.Background(), defaultAccountID, 1000)
+		if err != nil {
+			t.Fatalf("ListBillingEvents while running: %v", err)
+		}
+		var sum int64
+		for _, event := range events {
+			sum += event.Amount
+		}
+		if stats.QueueDepth == 0 && stats.Pending == 0 && len(events) == wantEvents && sum == wantSum {
+			persisted = events
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("writer did not drain: stats = %+v, events = %d, sum = %d", stats, len(events), sum)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	quota, err := quotaRepo.GetByAccountID(context.Background(), defaultAccountID)
+	if err != nil {
+		t.Fatalf("GetByAccountID before shutdown: %v", err)
+	}
+	if quota.Balance != 780 {
+		t.Fatalf("balance before shutdown = %d, want 780", quota.Balance)
+	}
+	if quota.Seq != 40 {
+		t.Fatalf("seq before shutdown = %d, want 40", quota.Seq)
+	}
+	var persistedSum int64
+	for _, event := range persisted {
+		persistedSum += event.Amount
+	}
+	if want := initialBalance + persistedSum; quota.Balance != want {
+		t.Fatalf("balance before shutdown = %d, want initialBalance + SUM(events) = %d", quota.Balance, want)
+	}
+
+	shutdownTestApp(t, first)
+
+	// Restart on the same file. Hydrate must restore balance and Seq so the
+	// `WHERE excluded.seq >= account_quotas.seq` upsert keeps accepting writes.
+	second, err := newApp(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("newApp second: %v", err)
+	}
+	if err := second.Start(); err != nil {
+		t.Fatalf("Start second: %v", err)
+	}
+	restarted := newE2EClient(t, second, cfg.AdminAPIKey)
+
+	account := restarted.mustStatus(http.MethodGet, "/api/v1/accounts/default", nil, "", http.StatusOK)
+	if account.Body["balance"] != float64(780) {
+		t.Fatalf("balance after restart = %v, want 780", account.Body["balance"])
+	}
+	charged := restarted.mustStatus(http.MethodPost, "/api/v1/accounts/default/charge", map[string]any{
+		"amount": 30, "reason": "post-restart",
+	}, "", http.StatusOK)
+	if charged.Body["balance"] != float64(750) {
+		t.Fatalf("balance after post-restart charge = %v, want 750", charged.Body["balance"])
+	}
+	if got := charged.Header.Get("X-Account-Balance"); got != "750" {
+		t.Fatalf("post-restart balance header = %q, want 750", got)
+	}
+
+	shutdownTestApp(t, second)
+
+	reopened, err := sqlite.Open(context.Background(), cfg.DBPath, cfg.DBReadConns)
+	if err != nil {
+		t.Fatalf("reopen sqlite: %v", err)
+	}
+	defer reopened.Close()
+
+	finalQuota, err := sqlite.NewQuotaRepository(reopened).GetByAccountID(context.Background(), defaultAccountID)
+	if err != nil {
+		t.Fatalf("GetByAccountID after restart: %v", err)
+	}
+	if finalQuota.Balance != 750 {
+		t.Fatalf("persisted balance after restart = %d, want 750", finalQuota.Balance)
+	}
+	if finalQuota.Seq != 41 {
+		t.Fatalf("persisted seq after restart = %d, want 41", finalQuota.Seq)
+	}
+	events, err := sqlite.NewAuditQuery(reopened).ListBillingEvents(context.Background(), defaultAccountID, 1000)
+	if err != nil {
+		t.Fatalf("ListBillingEvents after restart: %v", err)
+	}
+	if len(events) != wantEvents+1 {
+		t.Fatalf("persisted billing events after restart = %d, want %d", len(events), wantEvents+1)
+	}
+	var finalSum int64
+	for _, event := range events {
+		finalSum += event.Amount
+	}
+	if want := initialBalance + finalSum; finalQuota.Balance != want {
+		t.Fatalf("persisted balance = %d, want initialBalance + SUM(events) = %d", finalQuota.Balance, want)
+	}
+}
+
+// TestEndToEndCreditAndChargeUnderQueueSaturationNeverGoesNegative hammers the
+// explicit ledger routes while the write queue oscillates between saturated and
+// partially drained. It proves that a rejected credit is always a clean 503 and
+// that observed and persisted balances never go negative or invent credit.
+func TestEndToEndCreditAndChargeUnderQueueSaturationNeverGoesNegative(t *testing.T) {
+	const (
+		accountID      = defaultAccountID
+		ledgerAmount   = int64(100)
+		creditPath     = "/api/v1/accounts/" + accountID + "/credit"
+		chargePath     = "/api/v1/accounts/" + accountID + "/charge"
+		saturationPair = 4
+	)
+
+	cfg := baseTestConfig(t)
+	cfg.DefaultInitialBalance = 0
+	cfg.DefaultRateLimitRPM = 1000
+
+	app, err := newApp(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	if err := app.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	client := newE2EClient(t, app, cfg.AdminAPIKey)
+
+	held := make([]port.WriteReservation, 0, batcher.QueueCapacity)
+	releaseHeld := func() {
+		for _, res := range held {
+			res.Release()
+		}
+		held = held[:0]
+	}
+	defer releaseHeld()
+
+	// fill takes every slot that is currently free, which re-acquires capacity
+	// after each release round.
+	fill := func() {
+		for {
+			res, err := app.writer.Reserve()
+			if err != nil {
+				if !errors.Is(err, port.ErrQueueFull) {
+					t.Fatalf("Reserve: %v", err)
+				}
+				return
+			}
+			held = append(held, res)
+		}
+	}
+	releaseSome := func(n int) {
+		if n > len(held) {
+			n = len(held)
+		}
+		for _, res := range held[len(held)-n:] {
+			res.Release()
+		}
+		held = held[:len(held)-n]
+	}
+
+	type ledgerOutcome struct {
+		kind       string
+		status     int
+		code       string
+		balance    int64
+		hasBalance bool
+		err        error
+	}
+
+	runBatch := func(credits, charges int) []ledgerOutcome {
+		outcomes := make([]ledgerOutcome, credits+charges)
+		var wg sync.WaitGroup
+		launch := func(index int, kind, path string) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				outcome := ledgerOutcome{kind: kind}
+				response, err := client.do(http.MethodPost, path, map[string]any{
+					"amount": ledgerAmount, "reason": "saturation-" + kind,
+				}, "", "")
+				if err != nil {
+					outcome.err = err
+					outcomes[index] = outcome
+					return
+				}
+				outcome.status = response.Status
+				if errorValue, ok := response.Body["error"].(map[string]any); ok {
+					outcome.code, _ = errorValue["code"].(string)
+				}
+				if bodyBalance, ok := response.Body["balance"].(float64); ok {
+					outcome.balance = int64(bodyBalance)
+					outcome.hasBalance = true
+				}
+				if header := response.Header.Get("X-Account-Balance"); header != "" {
+					parsed, parseErr := strconv.ParseInt(header, 10, 64)
+					if parseErr != nil {
+						outcome.err = fmt.Errorf("%s balance header %q: %w", kind, header, parseErr)
+						outcomes[index] = outcome
+						return
+					}
+					if outcome.hasBalance && outcome.balance != parsed {
+						outcome.err = fmt.Errorf("%s body balance %d != header balance %d", kind, outcome.balance, parsed)
+						outcomes[index] = outcome
+						return
+					}
+					outcome.balance = parsed
+					outcome.hasBalance = true
+				}
+				outcomes[index] = outcome
+			}()
+		}
+		for i := 0; i < credits; i++ {
+			launch(i, "credit", creditPath)
+		}
+		for i := 0; i < charges; i++ {
+			launch(credits+i, "charge", chargePath)
+		}
+		wg.Wait()
+		return outcomes
+	}
+
+	verifyOutcomes := func(outcomes []ledgerOutcome) (creditOK, chargeOK int) {
+		t.Helper()
+		for _, outcome := range outcomes {
+			if outcome.err != nil {
+				t.Fatalf("%s: %v", outcome.kind, outcome.err)
+			}
+			switch outcome.kind {
+			case "credit":
+				switch outcome.status {
+				case http.StatusOK:
+					creditOK++
+				case http.StatusServiceUnavailable:
+					if outcome.code != "SERVICE_UNAVAILABLE" {
+						t.Fatalf("rejected credit code = %q, want SERVICE_UNAVAILABLE", outcome.code)
+					}
+				default:
+					t.Fatalf("credit status = %d, want 200 or 503; body code = %q", outcome.status, outcome.code)
+				}
+			case "charge":
+				switch outcome.status {
+				case http.StatusOK:
+					chargeOK++
+				case http.StatusPaymentRequired:
+					// A charge that wins a slot while the balance is zero is
+					// rejected without moving funds.
+				case http.StatusServiceUnavailable:
+					if outcome.code != "SERVICE_UNAVAILABLE" {
+						t.Fatalf("rejected charge code = %q, want SERVICE_UNAVAILABLE", outcome.code)
+					}
+				default:
+					t.Fatalf("charge status = %d, want 200, 402 or 503; body code = %q", outcome.status, outcome.code)
+				}
+			}
+			if outcome.hasBalance && outcome.balance < 0 {
+				t.Fatalf("%s observed negative balance %d", outcome.kind, outcome.balance)
+			}
+		}
+		return creditOK, chargeOK
+	}
+
+	observeBalance := func() int64 {
+		t.Helper()
+		account := client.mustStatus(http.MethodGet, "/api/v1/accounts/"+accountID, nil, "", http.StatusOK)
+		balance, ok := account.Body["balance"].(float64)
+		if !ok {
+			t.Fatalf("account balance is missing: %s", account.Raw)
+		}
+		if int64(balance) < 0 {
+			t.Fatalf("observed negative balance %d", int64(balance))
+		}
+		return int64(balance)
+	}
+
+	var creditOK, chargeOK int
+
+	// Round 1: the queue is completely full, so every concurrent credit and
+	// charge must be rejected before it can move balance.
+	fill()
+	if len(held) != batcher.QueueCapacity {
+		t.Fatalf("held reservations = %d, want %d", len(held), batcher.QueueCapacity)
+	}
+	full := runBatch(saturationPair, saturationPair)
+	for _, outcome := range full {
+		if outcome.status != http.StatusServiceUnavailable {
+			t.Fatalf("%s status with a full queue = %d, want 503", outcome.kind, outcome.status)
+		}
+	}
+	verifyOutcomes(full)
+	if balance := observeBalance(); balance != 0 {
+		t.Fatalf("balance after fully saturated round = %d, want 0", balance)
+	}
+
+	// Round 2: release exactly one slot so a concurrent batch races for it.
+	// The writer may recycle that slot between requests, so the split is not
+	// deterministic; every rejection must still be a clean 503 and no observed
+	// balance may go negative.
+	releaseSome(1)
+	mixed := runBatch(saturationPair, saturationPair)
+	mixedCreditOK, mixedChargeOK := verifyOutcomes(mixed)
+	creditOK += mixedCreditOK
+	chargeOK += mixedChargeOK
+	observeBalance()
+
+	// Round 3: re-acquire every free slot and repeat the race, proving the
+	// rejection path stays clean across release/re-acquire cycles.
+	fill()
+	releaseSome(2)
+	reacquired := runBatch(saturationPair, saturationPair)
+	reacquiredCreditOK, reacquiredChargeOK := verifyOutcomes(reacquired)
+	creditOK += reacquiredCreditOK
+	chargeOK += reacquiredChargeOK
+	observeBalance()
+
+	// Drain the queue, then prove the accepted path still moves exactly the
+	// requested amounts and never below zero.
+	releaseHeld()
+	for range 3 {
+		credit := client.mustStatus(http.MethodPost, creditPath, map[string]any{
+			"amount": ledgerAmount, "reason": "accepted-credit",
+		}, "", http.StatusOK)
+		if balance, ok := credit.Body["balance"].(float64); !ok || int64(balance) < 0 {
+			t.Fatalf("credit observed invalid balance %v", credit.Body["balance"])
+		}
+		creditOK++
+		observeBalance()
+
+		charge := client.mustStatus(http.MethodPost, chargePath, map[string]any{
+			"amount": ledgerAmount, "reason": "accepted-charge",
+		}, "", http.StatusOK)
+		if balance, ok := charge.Body["balance"].(float64); !ok || int64(balance) < 0 {
+			t.Fatalf("charge observed invalid balance %v", charge.Body["balance"])
+		}
+		chargeOK++
+		observeBalance()
+	}
+	if creditOK == 0 || chargeOK == 0 {
+		t.Fatalf("accepted ledger operations = (%d credits, %d charges), want both non-zero", creditOK, chargeOK)
+	}
+
+	expectedBalance := ledgerAmount * int64(creditOK-chargeOK)
+	if balance := observeBalance(); balance != expectedBalance {
+		t.Fatalf("balance before shutdown = %d, want %d", balance, expectedBalance)
+	}
+
+	shutdownTestApp(t, app)
+
+	reopened, err := sqlite.Open(context.Background(), cfg.DBPath, cfg.DBReadConns)
+	if err != nil {
+		t.Fatalf("reopen sqlite: %v", err)
+	}
+	defer reopened.Close()
+
+	quota, err := sqlite.NewQuotaRepository(reopened).GetByAccountID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetByAccountID: %v", err)
+	}
+	events, err := sqlite.NewAuditQuery(reopened).ListBillingEvents(context.Background(), accountID, 1000)
+	if err != nil {
+		t.Fatalf("ListBillingEvents: %v", err)
+	}
+	if len(events) != creditOK+chargeOK {
+		t.Fatalf("persisted billing events = %d, want %d accepted ledger operations", len(events), creditOK+chargeOK)
+	}
+	var (
+		sum          int64
+		creditEvents int
+		chargeEvents int
+	)
+	for _, event := range events {
+		sum += event.Amount
+		switch event.Amount {
+		case ledgerAmount:
+			creditEvents++
+		case -ledgerAmount:
+			chargeEvents++
+		default:
+			t.Fatalf("unexpected billing event amount %d", event.Amount)
+		}
+	}
+	if creditEvents != creditOK || chargeEvents != chargeOK {
+		t.Fatalf("persisted events = (%d credits, %d charges), want (%d, %d)",
+			creditEvents, chargeEvents, creditOK, chargeOK)
+	}
+	const startingBalance = int64(0)
+	if quota.Balance != startingBalance+sum {
+		t.Fatalf("persisted balance = %d, want startingBalance + SUM(events) = %d", quota.Balance, startingBalance+sum)
+	}
+	if quota.Balance != expectedBalance {
+		t.Fatalf("persisted balance = %d, want %d", quota.Balance, expectedBalance)
+	}
+	if quota.Balance < 0 {
+		t.Fatalf("persisted balance is negative: %d", quota.Balance)
 	}
 }

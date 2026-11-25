@@ -516,7 +516,7 @@ func testBillingEvent(index int) domain.BillingEvent {
 	}
 }
 
-func TestEnqueueBillingWithQuotaCommitsBothTogether(t *testing.T) {
+func TestReservedCommitBillingWithQuotaCommitsBothTogether(t *testing.T) {
 	sink := &fakeSink{}
 	b, err := New(sink, Options{BatchSize: 2, FlushInterval: 5 * time.Second, Logger: discardLogger()})
 	if err != nil {
@@ -536,17 +536,26 @@ func TestEnqueueBillingWithQuotaCommitsBothTogether(t *testing.T) {
 		RequestID:  "req_1",
 		OccurredAt: time.Now(),
 	}
-	if err := b.EnqueueBillingWithQuota(event, domain.AccountQuota{AccountID: "acct", Balance: 10, RateLimitRPM: 60}); err != nil {
-		t.Fatalf("EnqueueBillingWithQuota: %v", err)
+	reservation, err := b.Reserve()
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if err := reservation.CommitBillingWithQuota(event, domain.AccountQuota{AccountID: "acct", Balance: 10, RateLimitRPM: 60, Seq: 1}); err != nil {
+		t.Fatalf("CommitBillingWithQuota: %v", err)
 	}
 	// One queue slot holds both values.
 	if stats := b.Stats(); stats.Enqueued != 1 {
 		t.Fatalf("Enqueued = %d after one combined enqueue, want 1", stats.Enqueued)
 	}
+	// A settled reservation cannot be settled a second time.
+	if err := reservation.CommitQuotaSync(domain.AccountQuota{AccountID: "acct", Balance: 99}); err == nil {
+		t.Fatal("second settlement of the same reservation succeeded")
+	}
+	reservation.Release()
 
 	// A later quota for the same account replaces the embedded snapshot while
 	// the billing event is preserved.
-	if err := b.EnqueueQuotaSync(domain.AccountQuota{AccountID: "acct", Balance: 4, RateLimitRPM: 30}); err != nil {
+	if err := b.EnqueueQuotaSync(domain.AccountQuota{AccountID: "acct", Balance: 4, RateLimitRPM: 30, Seq: 2}); err != nil {
 		t.Fatalf("EnqueueQuotaSync: %v", err)
 	}
 
@@ -562,8 +571,8 @@ func TestEnqueueBillingWithQuotaCommitsBothTogether(t *testing.T) {
 	if len(payload.Quotas) != 1 {
 		t.Fatalf("quotas = %+v, want a single deduplicated quota", payload.Quotas)
 	}
-	if got := payload.Quotas[0]; got.AccountID != "acct" || got.Balance != 4 || got.RateLimitRPM != 30 {
-		t.Fatalf("quota = %+v, want latest snapshot 4/30", got)
+	if got := payload.Quotas[0]; got.AccountID != "acct" || got.Balance != 4 || got.RateLimitRPM != 30 || got.Seq != 2 {
+		t.Fatalf("quota = %+v, want latest snapshot 4/30 seq 2", got)
 	}
 }
 
@@ -785,5 +794,336 @@ func TestDrainWakesDuringRetryBackoff(t *testing.T) {
 	stats := b.Stats()
 	if stats.Errors == 0 || stats.Pending != 0 {
 		t.Fatalf("Stats() = %+v, want errors > 0 and pending 0", stats)
+	}
+}
+
+func TestReserveReleaseIsIdempotentAndReturnsCapacity(t *testing.T) {
+	b, err := New(&fakeSink{}, Options{QueueCapacity: 2, BatchSize: 4, FlushInterval: time.Hour, Logger: discardLogger()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	res, err := b.Reserve()
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	res.Release()
+	res.Release()
+	if got := len(b.tokens); got != 2 {
+		t.Fatalf("tokens after double Release = %d, want 2", got)
+	}
+	if stats := b.Stats(); stats.Dropped != 0 || stats.Enqueued != 0 {
+		t.Fatalf("Stats() = %+v, want no drops or enqueues", stats)
+	}
+
+	held := make([]port.WriteReservation, 0, 2)
+	for i := 0; i < 2; i++ {
+		res, err := b.Reserve()
+		if err != nil {
+			t.Fatalf("Reserve %d: %v", i, err)
+		}
+		held = append(held, res)
+	}
+	if _, err := b.Reserve(); !errors.Is(err, port.ErrQueueFull) {
+		t.Fatalf("Reserve beyond capacity error = %v, want ErrQueueFull", err)
+	}
+	if got := b.Stats().Dropped; got != 1 {
+		t.Fatalf("Dropped = %d, want 1", got)
+	}
+	for _, res := range held {
+		res.Release()
+	}
+	if err := b.Drain(context.Background()); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if _, err := b.Reserve(); !errors.Is(err, port.ErrQueueClosed) {
+		t.Fatalf("Reserve after Drain error = %v, want ErrQueueClosed", err)
+	}
+}
+
+func TestReservationCapacitySaturationStaysBounded(t *testing.T) {
+	const capacity = 4
+	sink := &blockingSink{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	b, err := New(sink, Options{
+		QueueCapacity: capacity,
+		BatchSize:     1,
+		FlushInterval: time.Hour,
+		Logger:        discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(sink.release) }) }
+	defer func() {
+		release()
+		if err := b.Drain(context.Background()); err != nil {
+			t.Errorf("Drain: %v", err)
+		}
+	}()
+
+	// Park the writer inside WriteBatch so the buffer cannot drain itself.
+	if err := b.EnqueueBilling(testBillingEvent(0)); err != nil {
+		t.Fatalf("first enqueue: %v", err)
+	}
+	select {
+	case <-sink.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer did not enter WriteBatch")
+	}
+
+	held := make([]port.WriteReservation, 0, capacity)
+	for i := 0; i < capacity; i++ {
+		res, err := b.Reserve()
+		if err != nil {
+			t.Fatalf("Reserve %d: %v", i, err)
+		}
+		held = append(held, res)
+	}
+	if got := len(b.ch) + len(held); got != capacity {
+		t.Fatalf("len(ch)+reservations = %d, want %d", got, capacity)
+	}
+	if _, err := b.Reserve(); !errors.Is(err, port.ErrQueueFull) {
+		t.Fatalf("over-capacity Reserve error = %v, want ErrQueueFull", err)
+	}
+
+	// Committing a reservation consumes its token and fills one buffer slot;
+	// the total outstanding capacity use must stay at capacity.
+	if err := held[0].CommitQuotaSync(domain.AccountQuota{AccountID: "acct", Balance: 1, Seq: 1}); err != nil {
+		t.Fatalf("CommitQuotaSync: %v", err)
+	}
+	if err := held[1].CommitBillingWithQuota(testBillingEvent(1), domain.AccountQuota{AccountID: "acct", Balance: 2, Seq: 2}); err != nil {
+		t.Fatalf("CommitBillingWithQuota: %v", err)
+	}
+	if got := len(b.ch) + (len(held) - 2); got != capacity {
+		t.Fatalf("outstanding capacity = %d, want %d", got, capacity)
+	}
+	// All tokens are still consumed, so an unreserved enqueue must be rejected
+	// instead of exceeding the channel capacity.
+	if err := b.EnqueueBilling(testBillingEvent(2)); !errors.Is(err, port.ErrQueueFull) {
+		t.Fatalf("unreserved enqueue at saturation error = %v, want ErrQueueFull", err)
+	}
+
+	held[2].Release()
+	held[3].Release()
+	if got := len(b.ch) + 2; got != capacity {
+		t.Fatalf("buffer after releases = %d, want %d capacity use", got, capacity)
+	}
+}
+
+func TestDrainWaitsForInFlightReservationCommit(t *testing.T) {
+	sink := &fakeSink{}
+	b, err := New(sink, Options{QueueCapacity: 2, BatchSize: 4, FlushInterval: time.Hour, Logger: discardLogger()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	reservation, err := b.Reserve()
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	drainResult := make(chan error, 1)
+	go func() { drainResult <- b.Drain(context.Background()) }()
+
+	// Drain must wait for the outstanding reservation instead of closing the
+	// channel underneath its eventual commit.
+	select {
+	case err := <-drainResult:
+		t.Fatalf("Drain returned before the reservation settled: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	event := testBillingEvent(0)
+	quota := domain.AccountQuota{AccountID: "acct", Balance: 9, Seq: 1}
+	if err := reservation.CommitBillingWithQuota(event, quota); err != nil {
+		t.Fatalf("CommitBillingWithQuota: %v", err)
+	}
+
+	select {
+	case err := <-drainResult:
+		if err != nil {
+			t.Fatalf("Drain: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Drain did not finish after the reservation committed")
+	}
+
+	payloads := sink.payloadSnapshot()
+	if len(payloads) != 1 || len(payloads[0].BillingEvents) != 1 || payloads[0].BillingEvents[0].ID != event.ID {
+		t.Fatalf("payloads = %+v, want the reserved billing event persisted", payloads)
+	}
+	if len(payloads[0].Quotas) != 1 || payloads[0].Quotas[0].Seq != 1 {
+		t.Fatalf("payloads = %+v, want the reserved quota persisted", payloads)
+	}
+}
+
+func TestDrainTimeoutWithUnreleasedReservationDoesNotPanic(t *testing.T) {
+	b, err := New(&fakeSink{}, Options{QueueCapacity: 2, BatchSize: 4, FlushInterval: time.Hour, Logger: discardLogger()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	reservation, err := b.Reserve()
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if err := b.Drain(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain error = %v, want context.DeadlineExceeded", err)
+	}
+
+	// The channel was not closed on timeout, so the leaked reservation can
+	// still be settled safely.
+	if err := reservation.CommitQuotaSync(domain.AccountQuota{AccountID: "acct", Balance: 3, Seq: 1}); err != nil {
+		t.Fatalf("CommitQuotaSync after timed-out Drain: %v", err)
+	}
+	reservation.Release()
+}
+
+// TestRepeatedDrainAfterTimeoutWithUnreleasedReservation guards the shutdown
+// path that used to strand the writer: an early Drain timeout must not be the
+// only chance to close the queue. Once the outstanding reservation settles,
+// the background closer has to wake the writer, and a later Drain must finish.
+func TestRepeatedDrainAfterTimeoutWithUnreleasedReservation(t *testing.T) {
+	b, err := New(&fakeSink{}, Options{QueueCapacity: 2, BatchSize: 4, FlushInterval: time.Hour, Logger: discardLogger()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	reservation, err := b.Reserve()
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if err := b.Drain(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Drain error = %v, want context.DeadlineExceeded", err)
+	}
+
+	// Settling the reservation must let the closer finish the shutdown even
+	// though the drain context has already expired.
+	reservation.Release()
+
+	second := make(chan error, 1)
+	go func() { second <- b.Drain(context.Background()) }()
+	select {
+	case err := <-second:
+		// The recorded outcome may reflect the expired first drain context,
+		// but it must never block.
+		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("second Drain error = %v, want nil or the timeout outcome", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Drain hung after the reservation was released")
+	}
+
+	select {
+	case <-b.done:
+	default:
+		t.Fatal("writer done channel did not close after the reservation was released")
+	}
+}
+
+// TestRepeatedDrainAfterCancelledContextWithoutReservation guards the second
+// stranding path: with no reservations the closer still has to run, so a
+// cancelled first Drain followed by a background Drain can never block.
+func TestRepeatedDrainAfterCancelledContextWithoutReservation(t *testing.T) {
+	for round := 0; round < 100; round++ {
+		b, err := New(&fakeSink{}, Options{QueueCapacity: 2, BatchSize: 4, FlushInterval: time.Hour, Logger: discardLogger()})
+		if err != nil {
+			t.Fatalf("round %d: New: %v", round, err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := b.Drain(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("round %d: first Drain error = %v, want context.Canceled", round, err)
+		}
+
+		second := make(chan error, 1)
+		go func() { second <- b.Drain(context.Background()) }()
+		select {
+		case <-second:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("round %d: second Drain hung after a cancelled first Drain", round)
+		}
+
+		select {
+		case <-b.done:
+		default:
+			t.Fatalf("round %d: writer done channel did not close", round)
+		}
+	}
+}
+
+func TestBuildPayloadKeepsHighestSeqQuota(t *testing.T) {
+	event := testBillingEvent(0)
+	payload := buildPayload([]writeEvent{
+		{kind: quotaEvent, quota: domain.AccountQuota{AccountID: "acct", Balance: 30, Seq: 3}},
+		{kind: quotaEvent, quota: domain.AccountQuota{AccountID: "acct", Balance: 10, Seq: 1}},
+		{kind: billingWithQuotaEvent, billing: event, quota: domain.AccountQuota{AccountID: "acct", Balance: 20, Seq: 2}},
+		{kind: quotaEvent, quota: domain.AccountQuota{AccountID: "other", Balance: 5, Seq: 1}},
+		{kind: quotaEvent, quota: domain.AccountQuota{AccountID: "acct", Balance: 33, Seq: 3}},
+	})
+
+	if len(payload.BillingEvents) != 1 || payload.BillingEvents[0].ID != event.ID {
+		t.Fatalf("billing events = %+v, want the embedded event preserved", payload.BillingEvents)
+	}
+	if len(payload.Quotas) != 2 {
+		t.Fatalf("quotas = %+v, want two accounts", payload.Quotas)
+	}
+	quotas := make(map[string]domain.AccountQuota, len(payload.Quotas))
+	for _, quota := range payload.Quotas {
+		quotas[quota.AccountID] = quota
+	}
+	if got := quotas["acct"]; got.Seq != 3 || got.Balance != 33 {
+		t.Fatalf("acct quota = %+v, want the highest-Seq snapshot 33/3", got)
+	}
+	if got := quotas["other"]; got.Seq != 1 || got.Balance != 5 {
+		t.Fatalf("other quota = %+v", got)
+	}
+}
+
+func TestFinishStopsCommittingAfterPersistentFailure(t *testing.T) {
+	sink := &flakySink{}
+	sink.failures.Store(1_000)
+
+	// Build the shutdown path directly so the test controls exactly which
+	// events are pending and which are already buffered.
+	b := &Batcher{
+		sink:            sink,
+		batchSize:       2,
+		flushInterval:   time.Millisecond,
+		maxRetryBackoff: time.Millisecond,
+		logger:          discardLogger(),
+		ch:              make(chan writeEvent, 8),
+		done:            make(chan struct{}),
+		stopCh:          make(chan struct{}),
+		tokens:          make(chan struct{}, 8),
+	}
+	for i := 0; i < 8; i++ {
+		b.ch <- writeEvent{kind: billingEvent, billing: testBillingEvent(i)}
+	}
+	close(b.ch)
+
+	b.finish(nil)
+
+	// One chunk with its bounded retries: 1 attempt + 3 retries. The three
+	// later chunks must not be attempted at all.
+	if got := sink.attempts.Load(); got != 4 {
+		t.Fatalf("commit attempts = %d, want 4 (one failed chunk plus retries)", got)
+	}
+	if err := b.result(); err == nil {
+		t.Fatal("drain error = nil, want the persistent sink failure")
+	}
+	if got := b.Stats().Pending; got != 0 {
+		t.Fatalf("Pending = %d, want 0", got)
+	}
+	if got := b.Stats().QueueDepth; got != 0 {
+		t.Fatalf("QueueDepth = %d, want 0", got)
 	}
 }

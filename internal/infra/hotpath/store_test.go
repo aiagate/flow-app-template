@@ -390,27 +390,27 @@ func TestCreditAndRefund(t *testing.T) {
 
 	// An unknown account starts from zero plus the credited amount; it does not
 	// inherit the configured initial balance.
-	if err := store.Credit("acct", 5); err != nil {
+	if _, err := store.Credit("acct", 5, nil); err != nil {
 		t.Fatalf("Credit: %v", err)
 	}
 	state, ok := store.GetAccountState("acct")
 	if !ok || state.Balance != 5 || state.RateLimitRPM != 100 {
 		t.Fatalf("state after credit = %+v, ok=%v", state, ok)
 	}
-	store.Refund("acct", 3)
+	store.Refund("acct", 3, nil)
 	state, _ = store.GetAccountState("acct")
 	if state.Balance != 8 {
 		t.Fatalf("balance after refund = %d, want 8", state.Balance)
 	}
 
 	// Non-positive movements are ignored.
-	if err := store.Credit("acct", 0); err != nil {
+	if _, err := store.Credit("acct", 0, nil); err != nil {
 		t.Fatalf("zero Credit: %v", err)
 	}
-	if err := store.Credit("acct", -4); err != nil {
+	if _, err := store.Credit("acct", -4, nil); err != nil {
 		t.Fatalf("negative Credit: %v", err)
 	}
-	store.Refund("acct", -1)
+	store.Refund("acct", -1, nil)
 	state, _ = store.GetAccountState("acct")
 	if state.Balance != 8 {
 		t.Fatalf("balance after no-op movements = %d, want 8", state.Balance)
@@ -418,7 +418,7 @@ func TestCreditAndRefund(t *testing.T) {
 
 	// Credit lazily creates an unknown account with exactly the credited
 	// amount, not initial balance + amount.
-	if err := store.Credit("new", 7); err != nil {
+	if _, err := store.Credit("new", 7, nil); err != nil {
 		t.Fatalf("Credit new: %v", err)
 	}
 	state, ok = store.GetAccountState("new")
@@ -437,10 +437,10 @@ func TestCreditAndRefund(t *testing.T) {
 func TestCreditRejectsOverflowWithoutMutating(t *testing.T) {
 	store := New(Options{InitialBalance: 0, DefaultRateLimitRPM: 100})
 
-	if err := store.Credit("acct", math.MaxInt64); err != nil {
+	if _, err := store.Credit("acct", math.MaxInt64, nil); err != nil {
 		t.Fatalf("Credit max balance: %v", err)
 	}
-	err := store.Credit("acct", 1)
+	_, err := store.Credit("acct", 1, nil)
 	if err == nil {
 		t.Fatal("Credit succeeded past math.MaxInt64")
 	}
@@ -636,8 +636,8 @@ func TestRefundConcurrentConservation(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := int64(0); j < credits; j++ {
-				store.Credit("acct", 2)
-				store.Refund("acct", 1)
+				store.Credit("acct", 2, nil)
+				store.Refund("acct", 1, nil)
 			}
 		}()
 	}

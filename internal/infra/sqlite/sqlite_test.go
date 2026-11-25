@@ -71,6 +71,13 @@ func mustTeam(t *testing.T, name string) *domain.Team {
 	return domain.FormTeam(mustTeamName(t, name))
 }
 
+func assertQuota(t *testing.T, got domain.AccountQuota, wantBalance int64, wantRPM int, wantSeq int64) {
+	t.Helper()
+	if got.Balance != wantBalance || got.RateLimitRPM != wantRPM || got.Seq != wantSeq {
+		t.Fatalf("quota = %+v, want balance %d rpm %d seq %d", got, wantBalance, wantRPM, wantSeq)
+	}
+}
+
 type rowQuerier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
@@ -248,8 +255,8 @@ func TestMigrationSchemaAndIdempotence(t *testing.T) {
 	if err := store.ReadDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&migrationCount); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if migrationCount != 2 {
-		t.Fatalf("schema_migrations count = %d, want 2", migrationCount)
+	if migrationCount != 3 {
+		t.Fatalf("schema_migrations count = %d, want 3", migrationCount)
 	}
 
 	tables := []string{
@@ -529,9 +536,9 @@ func TestWriteBatch(t *testing.T) {
 	payload := port.BatchPayload{
 		BillingEvents: []domain.BillingEvent{eventOne, eventTwo},
 		Quotas: []domain.AccountQuota{
-			{AccountID: "acct_a", Balance: 100, RateLimitRPM: 10, UpdatedAt: base},
-			{AccountID: "acct_b", Balance: 50, RateLimitRPM: 20, UpdatedAt: base},
-			{AccountID: "acct_a", Balance: 999, RateLimitRPM: 30, UpdatedAt: base.Add(time.Second)},
+			{AccountID: "acct_a", Balance: 100, RateLimitRPM: 10, Seq: 1, UpdatedAt: base},
+			{AccountID: "acct_b", Balance: 50, RateLimitRPM: 20, Seq: 1, UpdatedAt: base},
+			{AccountID: "acct_a", Balance: 999, RateLimitRPM: 30, Seq: 2, UpdatedAt: base.Add(time.Second)},
 		},
 		RequestLogs: []domain.RequestLog{logOne, logTwo},
 	}
@@ -543,8 +550,8 @@ func TestWriteBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get quota A: %v", err)
 	}
-	if quotaA.Balance != 999 || quotaA.RateLimitRPM != 30 {
-		t.Fatalf("quota A = %+v, want latest deduplicated value", quotaA)
+	if quotaA.Balance != 999 || quotaA.RateLimitRPM != 30 || quotaA.Seq != 2 {
+		t.Fatalf("quota A = %+v, want latest deduplicated value with seq 2", quotaA)
 	}
 	allQuotas, err := quotas.ListAll(ctx)
 	if err != nil {
@@ -601,7 +608,7 @@ func TestWriteBatch(t *testing.T) {
 	// duplicate account.
 	if err := store.WriteBatch(ctx, port.BatchPayload{
 		Quotas: []domain.AccountQuota{
-			{AccountID: "acct_a", Balance: 555, RateLimitRPM: 60, UpdatedAt: base.Add(2 * time.Second)},
+			{AccountID: "acct_a", Balance: 555, RateLimitRPM: 60, Seq: 3, UpdatedAt: base.Add(2 * time.Second)},
 		},
 	}); err != nil {
 		t.Fatalf("second WriteBatch: %v", err)
@@ -610,8 +617,8 @@ func TestWriteBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get updated quota A: %v", err)
 	}
-	if quotaA.Balance != 555 || quotaA.RateLimitRPM != 60 {
-		t.Fatalf("quota A after upsert = %+v, want balance 555 rpm 60", quotaA)
+	if quotaA.Balance != 555 || quotaA.RateLimitRPM != 60 || quotaA.Seq != 3 {
+		t.Fatalf("quota A after upsert = %+v, want balance 555 rpm 60 seq 3", quotaA)
 	}
 	allQuotas, err = quotas.ListAll(ctx)
 	if err != nil {
@@ -657,6 +664,139 @@ func TestWriteBatch(t *testing.T) {
 	}
 	if len(logsAfter) != 2 {
 		t.Fatalf("log count after rollback = %d, want 2", len(logsAfter))
+	}
+}
+
+func TestWriteBatchKeepsHighestSeqWithinBatch(t *testing.T) {
+	store := openTestStore(t, 5)
+	ctx := context.Background()
+	quotas := NewQuotaRepository(store)
+	base := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+
+	payload := port.BatchPayload{Quotas: []domain.AccountQuota{
+		{AccountID: "acct_seq", Balance: 70, RateLimitRPM: 10, Seq: 2, UpdatedAt: base},
+		{AccountID: "acct_seq", Balance: 90, RateLimitRPM: 20, Seq: 1, UpdatedAt: base.Add(time.Second)},
+	}}
+
+	deduped := dedupeQuotas(payload.Quotas)
+	if len(deduped) != 1 {
+		t.Fatalf("dedupeQuotas length = %d, want 1", len(deduped))
+	}
+	assertQuota(t, deduped[0], 70, 10, 2)
+
+	if err := store.WriteBatch(ctx, payload); err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+	got, err := quotas.GetByAccountID(ctx, "acct_seq")
+	if err != nil {
+		t.Fatalf("get quota: %v", err)
+	}
+	assertQuota(t, got, 70, 10, 2)
+}
+
+func TestWriteBatchIgnoresStaleSeqAcrossBatches(t *testing.T) {
+	store := openTestStore(t, 5)
+	ctx := context.Background()
+	quotas := NewQuotaRepository(store)
+	base := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+
+	if err := store.WriteBatch(ctx, port.BatchPayload{Quotas: []domain.AccountQuota{
+		{AccountID: "acct_seq", Balance: 70, RateLimitRPM: 10, Seq: 2, UpdatedAt: base},
+	}}); err != nil {
+		t.Fatalf("first WriteBatch: %v", err)
+	}
+	// A delayed snapshot with a lower Seq must not roll the balance back.
+	if err := store.WriteBatch(ctx, port.BatchPayload{Quotas: []domain.AccountQuota{
+		{AccountID: "acct_seq", Balance: 90, RateLimitRPM: 20, Seq: 1, UpdatedAt: base.Add(time.Second)},
+	}}); err != nil {
+		t.Fatalf("second WriteBatch: %v", err)
+	}
+
+	got, err := quotas.GetByAccountID(ctx, "acct_seq")
+	if err != nil {
+		t.Fatalf("get quota: %v", err)
+	}
+	assertQuota(t, got, 70, 10, 2)
+}
+
+func TestWriteBatchAppliesSameSeqUpdate(t *testing.T) {
+	store := openTestStore(t, 5)
+	ctx := context.Background()
+	quotas := NewQuotaRepository(store)
+	base := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+
+	if err := store.WriteBatch(ctx, port.BatchPayload{Quotas: []domain.AccountQuota{
+		{AccountID: "acct_seq", Balance: 70, RateLimitRPM: 10, Seq: 2, UpdatedAt: base},
+	}}); err != nil {
+		t.Fatalf("first WriteBatch: %v", err)
+	}
+	// Replaying the same Seq is idempotent for the balance and still applies a
+	// corrected rate limit.
+	if err := store.WriteBatch(ctx, port.BatchPayload{Quotas: []domain.AccountQuota{
+		{AccountID: "acct_seq", Balance: 70, RateLimitRPM: 60, Seq: 2, UpdatedAt: base.Add(time.Second)},
+	}}); err != nil {
+		t.Fatalf("second WriteBatch: %v", err)
+	}
+
+	got, err := quotas.GetByAccountID(ctx, "acct_seq")
+	if err != nil {
+		t.Fatalf("get quota: %v", err)
+	}
+	assertQuota(t, got, 70, 60, 2)
+}
+
+func TestQuotaRepositoryPreservesSeqAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "flow.db")
+	ctx := context.Background()
+	base := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	quota := domain.AccountQuota{
+		AccountID: "acct_seq", Balance: 70, RateLimitRPM: 45, Seq: 7, UpdatedAt: base,
+	}
+
+	first, err := Open(ctx, path, 5)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	if err := first.WriteBatch(ctx, port.BatchPayload{
+		Quotas: []domain.AccountQuota{quota},
+	}); err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+	got, err := NewQuotaRepository(first).GetByAccountID(ctx, quota.AccountID)
+	if err != nil {
+		t.Fatalf("get quota before reopen: %v", err)
+	}
+	assertQuota(t, got, 70, 45, 7)
+	if err := first.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	second, err := Open(ctx, path, 5)
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := second.Close(); err != nil {
+			t.Errorf("second Close: %v", err)
+		}
+	})
+	repo := NewQuotaRepository(second)
+	got, err = repo.GetByAccountID(ctx, quota.AccountID)
+	if err != nil {
+		t.Fatalf("get quota after reopen: %v", err)
+	}
+	assertQuota(t, got, 70, 45, 7)
+
+	listed, err := repo.ListAll(ctx)
+	if err != nil {
+		t.Fatalf("ListAll after reopen: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("ListAll length = %d, want 1", len(listed))
+	}
+	assertQuota(t, listed[0], 70, 45, 7)
+	if !listed[0].UpdatedAt.Equal(base) {
+		t.Fatalf("UpdatedAt = %s, want %s", listed[0].UpdatedAt, base)
 	}
 }
 
@@ -940,8 +1080,8 @@ func TestOpenCreatesParentAndReopensExistingDatabase(t *testing.T) {
 	if err := second.ReadDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&migrationsApplied); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if migrationsApplied != 2 {
-		t.Fatalf("schema_migrations count = %d, want 2", migrationsApplied)
+	if migrationsApplied != 3 {
+		t.Fatalf("schema_migrations count = %d, want 3", migrationsApplied)
 	}
 }
 

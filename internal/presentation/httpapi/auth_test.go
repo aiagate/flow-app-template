@@ -376,7 +376,18 @@ func TestQueueAndCapacityFailuresReturn503(t *testing.T) {
 		}), "SERVICE_UNAVAILABLE", http.StatusServiceUnavailable)
 
 		if got := env.guard.accounts["acct-a"].Balance; got != before {
-			t.Fatalf("credit was not rolled back: balance %d, want %d", got, before)
+			t.Fatalf("credit mutated the balance: got %d, want %d", got, before)
+		}
+
+		assertErrorCode(t, call(t, env.handler, http.MethodPost, "/api/v1/accounts/acct-a/charge", map[string]any{
+			"amount": 20, "reason": "manual",
+		}), "SERVICE_UNAVAILABLE", http.StatusServiceUnavailable)
+
+		if got := env.guard.accounts["acct-a"].Balance; got != before {
+			t.Fatalf("charge mutated the balance: got %d, want %d", got, before)
+		}
+		if _, active, _, _ := env.queue.reservationCounts(); active != 0 {
+			t.Fatalf("active reservations = %d, want 0", active)
 		}
 	})
 
@@ -391,7 +402,7 @@ func TestQueueAndCapacityFailuresReturn503(t *testing.T) {
 		}), "SERVICE_UNAVAILABLE", http.StatusServiceUnavailable)
 	})
 
-	t.Run("queue closed refunds a charge", func(t *testing.T) {
+	t.Run("queue closed rejects a charge", func(t *testing.T) {
 		env := newTestEnvironment(t)
 		before := env.guard.accounts["acct-a"].Balance
 		env.queue.mu.Lock()
@@ -403,7 +414,7 @@ func TestQueueAndCapacityFailuresReturn503(t *testing.T) {
 		}), "SERVICE_UNAVAILABLE", http.StatusServiceUnavailable)
 
 		if got := env.guard.accounts["acct-a"].Balance; got != before {
-			t.Fatalf("charge was not refunded: balance %d, want %d", got, before)
+			t.Fatalf("charge mutated the balance: got %d, want %d", got, before)
 		}
 	})
 }

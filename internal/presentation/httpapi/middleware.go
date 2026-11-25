@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aiagate/flow-app-template/internal/contract/port"
 	"github.com/aiagate/flow-app-template/internal/domain"
 	"github.com/aiagate/flow-app-template/internal/usecase"
 )
@@ -309,91 +310,91 @@ func (h *Handler) withGuard(route string, preDebit, accountFromPath bool, next h
 			r = r.WithContext(context.WithValue(r.Context(), accountIDContextKey, accountID))
 		}
 
-		var (
-			decision domain.HotPathDecision
-			err      error
-		)
-		if preDebit {
-			decision, err = h.deps.HotPath.AcquireAndDebit(accountID, route)
-		} else {
-			decision, err = h.deps.HotPath.Authorize(accountID, route)
-		}
-
-		setRateHeaders(w, decision)
-		if err != nil {
-			h.writeError(w, err)
-			return
-		}
 		if !preDebit {
+			decision, err := h.deps.HotPath.Authorize(accountID, route)
+			setRateHeaders(w, decision)
+			if err != nil {
+				h.writeError(w, usecase.ClassifyError(err))
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		recorder := newStatusRecorder(w)
-		next.ServeHTTP(recorder, r)
-		h.settleMeteredRequest(r, accountID, decision, recorder.status)
+		// Reserve the write slot before admission so a full queue rejects the
+		// request without consuming balance or rate-limit tokens.
+		res, err := h.deps.Queue.Reserve()
+		if err != nil {
+			h.writeError(w, usecase.ClassifyError(err))
+			return
+		}
+		defer res.Release()
+
+		decision, err := h.deps.HotPath.AcquireAndDebit(accountID, route)
+		setRateHeaders(w, decision)
+		if err != nil {
+			h.writeError(w, usecase.ClassifyError(err))
+			return
+		}
+		if decision.Cost <= 0 {
+			// Nothing to settle, so hand the slot back before the handler runs.
+			res.Release()
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		h.settleMeteredRequest(r.Context(), accountID, decision, rec.status, res)
 	})
 }
 
-// settleMeteredRequest persists a successful pre-debit atomically with the
-// quota snapshot, or refunds it after a 5xx response.
-func (h *Handler) settleMeteredRequest(r *http.Request, accountID string, decision domain.HotPathDecision, status int) {
-	if decision.Cost <= 0 {
+// settleMeteredRequest commits a successful pre-debit atomically with the
+// quota snapshot captured under the bucket lock, or refunds it after a 5xx
+// response. The reservation is always settled by the end of this call.
+func (h *Handler) settleMeteredRequest(ctx context.Context, accountID string, decision domain.HotPathDecision, status int, res port.WriteReservation) {
+	if status >= http.StatusInternalServerError {
+		h.deps.HotPath.Refund(accountID, decision.Cost, func(st domain.AccountState) {
+			if err := res.CommitQuotaSync(domain.AccountQuota{
+				AccountID:    accountID,
+				Balance:      st.Balance,
+				RateLimitRPM: st.RateLimitRPM,
+				Seq:          st.Seq,
+				UpdatedAt:    st.UpdatedAt,
+			}); err != nil {
+				h.logger.Warn("commit refunded quota",
+					slog.Any("error", err),
+					slog.String("account_id", accountID),
+					slog.String("request_id", requestIDFrom(ctx)),
+				)
+			}
+		})
 		return
 	}
 
 	now := time.Now().UTC()
-	if status >= http.StatusInternalServerError {
-		h.deps.HotPath.Refund(accountID, decision.Cost)
-		h.enqueueQuota(accountID, now)
-		return
-	}
-	if h.deps.Queue == nil {
-		return
-	}
-	state, ok := h.deps.HotPath.GetAccountState(accountID)
-	if !ok {
-		return
-	}
-	if err := h.deps.Queue.EnqueueBillingWithQuota(
+	if err := res.CommitBillingWithQuota(
 		domain.BillingEvent{
 			ID:         domain.NewEventID(),
 			AccountID:  accountID,
 			Amount:     -decision.Cost,
 			Reason:     "request",
-			RequestID:  requestIDFrom(r.Context()),
+			RequestID:  requestIDFrom(ctx),
 			OccurredAt: now,
 		},
 		domain.AccountQuota{
-			AccountID:    state.AccountID,
-			Balance:      state.Balance,
-			RateLimitRPM: state.RateLimitRPM,
+			AccountID:    accountID,
+			Balance:      decision.RemainingBalance,
+			RateLimitRPM: decision.AccountRateLimitRPM,
+			Seq:          decision.Seq,
 			UpdatedAt:    now,
 		},
 	); err != nil {
 		h.logger.Warn("enqueue metered billing",
 			slog.Any("error", err),
 			slog.String("account_id", accountID),
-			slog.String("request_id", requestIDFrom(r.Context())),
+			slog.String("request_id", requestIDFrom(ctx)),
 		)
-	}
-}
-
-func (h *Handler) enqueueQuota(accountID string, updatedAt time.Time) {
-	if h.deps.Queue == nil {
-		return
-	}
-	state, ok := h.deps.HotPath.GetAccountState(accountID)
-	if !ok {
-		return
-	}
-	if err := h.deps.Queue.EnqueueQuotaSync(domain.AccountQuota{
-		AccountID:    state.AccountID,
-		Balance:      state.Balance,
-		RateLimitRPM: state.RateLimitRPM,
-		UpdatedAt:    updatedAt,
-	}); err != nil {
-		h.logger.Warn("enqueue quota sync", slog.Any("error", err), slog.String("account_id", accountID))
 	}
 }
 

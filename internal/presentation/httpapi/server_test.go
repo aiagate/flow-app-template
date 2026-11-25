@@ -8,9 +8,11 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/aiagate/flow-app-template/internal/contract/port"
 	"github.com/aiagate/flow-app-template/internal/domain"
 	"github.com/aiagate/flow-app-template/internal/usecase"
 )
@@ -72,6 +74,15 @@ func call(t *testing.T, handler http.Handler, method, path string, body any, opt
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
 	return recorder
+}
+
+// guardedRequest builds a request that already carries the account and request
+// ID context withGuard expects from the authentication middleware.
+func guardedRequest(t *testing.T, accountID, requestID string) *http.Request {
+	t.Helper()
+	ctx := context.WithValue(context.Background(), accountIDContextKey, accountID)
+	ctx = context.WithValue(ctx, requestIDContextKey, requestID)
+	return httptest.NewRequest(http.MethodGet, "/api/v1/test", nil).WithContext(ctx)
 }
 
 func decodeMap(t *testing.T, recorder *httptest.ResponseRecorder) map[string]any {
@@ -572,7 +583,7 @@ func TestRuntimeConfigAndGuardEndpoints(t *testing.T) {
 	assertStatus(t, call(t, env.handler, http.MethodGet, "/api/v1/users", nil, withAccount("broke")), http.StatusOK)
 
 	// Rate limit a fresh account on one route: two succeed, the third is 429.
-	_ = env.guard.Credit("limited", 100)
+	_, _ = env.guard.Credit("limited", 100, nil)
 	assertStatus(t, call(t, env.handler, http.MethodPut, "/api/v1/runtime/config", map[string]any{
 		"default_rate_limit_rpm": 120,
 		"default_request_cost":   1,
@@ -594,39 +605,233 @@ func TestRuntimeConfigAndGuardEndpoints(t *testing.T) {
 	assertErrorCode(t, call(t, env.handler, http.MethodGet, "/api/v1/teams", nil, withAccount("limited")), "RATE_LIMITED", http.StatusTooManyRequests)
 }
 
-func TestGuardRefundsFiveHundredsAndPanicRecovery(t *testing.T) {
+func TestGuardRefundsFiveHundredsAndPanicThroughReservation(t *testing.T) {
+	cases := []struct {
+		name string
+		next http.HandlerFunc
+	}{
+		{"server error", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}},
+		{"panic", func(http.ResponseWriter, *http.Request) { panic("boom") }},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			env := newTestEnvironment(t)
+			const accountID = "acct-a"
+			beforeBalance := env.guard.accounts[accountID].Balance
+			beforeBilling, beforeQuotas, _ := env.queue.snapshot()
+
+			recorder := httptest.NewRecorder()
+			guarded := env.handler.withGuard("GET /api/v1/failing", true, false,
+				env.handler.withPanicRecovery(testCase.next))
+			guarded.ServeHTTP(recorder, guardedRequest(t, accountID, "refund-request"))
+			assertStatus(t, recorder, http.StatusInternalServerError)
+
+			state, _ := env.guard.GetAccountState(accountID)
+			if state.Balance != beforeBalance || state.Seq != 2 {
+				t.Fatalf("state = %+v, want the pre-debit refunded with seq 2", state)
+			}
+			afterBilling, afterQuotas, _ := env.queue.snapshot()
+			if len(afterBilling) != len(beforeBilling) {
+				t.Fatal("a failed request committed a billing event")
+			}
+			if len(afterQuotas) != len(beforeQuotas)+1 {
+				t.Fatalf("refund quotas = %+v", afterQuotas)
+			}
+			quota := afterQuotas[len(afterQuotas)-1]
+			if quota.Balance != beforeBalance || quota.Seq != 2 {
+				t.Fatalf("refunded quota = %+v, want balance %d seq 2", quota, beforeBalance)
+			}
+			reserved, active, committed, _ := env.queue.reservationCounts()
+			if reserved != 1 || active != 0 || committed != 1 {
+				t.Fatalf("reservations reserved=%d active=%d committed=%d", reserved, active, committed)
+			}
+		})
+	}
+}
+
+func TestGuardQueueFullRejectsWithoutMutation(t *testing.T) {
 	env := newTestEnvironment(t)
-	_ = env.guard.Credit("refund", 10)
+	const accountID = "acct-a"
 
-	beforeBilling, _, _ := env.queue.snapshot()
-	ctx := context.WithValue(context.Background(), accountIDContextKey, "refund")
-	ctx = context.WithValue(ctx, requestIDContextKey, "refund-request")
-	request := httptest.NewRequest(http.MethodGet, "/api/v1/failing", nil).WithContext(ctx)
+	// One successful request first so a rate-limit token has been consumed and
+	// the failed request can prove it consumed nothing else.
+	okRecorder := httptest.NewRecorder()
+	env.handler.withGuard("GET /api/v1/test", true, false,
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }),
+	).ServeHTTP(okRecorder, guardedRequest(t, accountID, "ok"))
+	assertStatus(t, okRecorder, http.StatusOK)
+
+	beforeBalance := env.guard.accounts[accountID].Balance
+	beforeTokens := env.guard.rateCount(accountID)
+	beforeBilling, beforeQuotas, _ := env.queue.snapshot()
+
+	env.queue.mu.Lock()
+	env.queue.err = port.ErrQueueFull
+	env.queue.mu.Unlock()
+
+	invoked := false
 	recorder := httptest.NewRecorder()
+	env.handler.withGuard("GET /api/v1/test", true, false,
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) { invoked = true }),
+	).ServeHTTP(recorder, guardedRequest(t, accountID, "queue-full"))
 
-	failing := env.handler.withGuard("GET /api/v1/failing", true, false, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	failing.ServeHTTP(recorder, request)
-	assertStatus(t, recorder, http.StatusInternalServerError)
-
-	if state, _ := env.guard.GetAccountState("refund"); state.Balance != 10 {
-		t.Fatalf("balance after 500 = %d, want the pre-debit refunded", state.Balance)
+	assertErrorCode(t, recorder, "SERVICE_UNAVAILABLE", http.StatusServiceUnavailable)
+	if invoked {
+		t.Fatal("handler ran despite a full write queue")
+	}
+	if got := env.guard.accounts[accountID].Balance; got != beforeBalance {
+		t.Fatalf("balance = %d, want %d", got, beforeBalance)
+	}
+	if got := env.guard.rateCount(accountID); got != beforeTokens {
+		t.Fatalf("rate tokens consumed = %d, want %d", got, beforeTokens)
 	}
 	afterBilling, afterQuotas, _ := env.queue.snapshot()
-	if len(afterBilling) != len(beforeBilling) {
-		t.Fatal("a failed request enqueued a billing event")
+	if len(afterBilling) != len(beforeBilling) || len(afterQuotas) != len(beforeQuotas) {
+		t.Fatalf("queue full persisted billing=%d quotas=%d", len(afterBilling), len(afterQuotas))
 	}
-	if len(afterQuotas) == 0 || afterQuotas[len(afterQuotas)-1].Balance != 10 {
-		t.Fatalf("refund did not enqueue a corrected quota: %+v", afterQuotas)
+	if _, active, _, _ := env.queue.reservationCounts(); active != 0 {
+		t.Fatalf("active reservations = %d, want 0", active)
+	}
+}
+
+func TestGuardFreeRouteReleasesReservationBeforeTheHandler(t *testing.T) {
+	env := newTestEnvironment(t)
+	const accountID = "acct-a"
+	env.guard.mu.Lock()
+	env.guard.config.Routes = map[string]domain.RoutePolicy{
+		"GET /api/v1/free": {Enabled: true, Cost: 0},
+	}
+	env.guard.mu.Unlock()
+	beforeBalance := env.guard.accounts[accountID].Balance
+
+	activeInHandler := -1
+	recorder := httptest.NewRecorder()
+	env.handler.withGuard("GET /api/v1/free", true, false, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, activeInHandler, _, _ = env.queue.reservationCounts()
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(recorder, guardedRequest(t, accountID, "free"))
+
+	assertStatus(t, recorder, http.StatusNoContent)
+	if activeInHandler != 0 {
+		t.Fatalf("active reservations in handler = %d, want the slot released", activeInHandler)
+	}
+	reserved, active, committed, released := env.queue.reservationCounts()
+	if reserved != 1 || active != 0 || committed != 0 || released != 1 {
+		t.Fatalf("reservations reserved=%d active=%d committed=%d released=%d", reserved, active, committed, released)
+	}
+	if got := env.guard.accounts[accountID].Balance; got != beforeBalance {
+		t.Fatalf("balance = %d, want %d", got, beforeBalance)
+	}
+}
+
+func TestMeteredRequestsCommitDecisionBalanceAndSeq(t *testing.T) {
+	cases := []struct {
+		name       string
+		method     string
+		path       string
+		wantStatus int
+	}{
+		{"2xx", http.MethodGet, "/api/v1/users", http.StatusOK},
+		{"4xx", http.MethodGet, "/api/v1/users/not-a-ulid", http.StatusBadRequest},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			env := newTestEnvironment(t)
+			before := env.guard.accounts["default"].Balance
+
+			recorder := call(t, env.handler, testCase.method, testCase.path, nil)
+			assertStatus(t, recorder, testCase.wantStatus)
+
+			billing, quotas, _ := env.queue.snapshot()
+			if len(billing) != 1 {
+				t.Fatalf("billing events = %+v", billing)
+			}
+			if billing[0].Amount != -1 || billing[0].AccountID != "default" ||
+				billing[0].RequestID == "" || billing[0].ID.IsZero() {
+				t.Fatalf("billing event = %+v", billing[0])
+			}
+			if len(quotas) != 1 {
+				t.Fatalf("quotas = %+v", quotas)
+			}
+			quota := quotas[0]
+			if quota.AccountID != "default" || quota.Balance != before-1 || quota.Seq != 1 {
+				t.Fatalf("quota = %+v, want balance %d seq 1", quota, before-1)
+			}
+			if quota.RateLimitRPM != 120 {
+				t.Fatalf("quota rate limit = %d, want 120", quota.RateLimitRPM)
+			}
+			if !quota.UpdatedAt.Equal(billing[0].OccurredAt) {
+				t.Fatalf("quota updated_at %s != event occurred_at %s", quota.UpdatedAt, billing[0].OccurredAt)
+			}
+			reserved, active, committed, _ := env.queue.reservationCounts()
+			if reserved != 1 || active != 0 || committed != 1 {
+				t.Fatalf("reservations reserved=%d active=%d committed=%d", reserved, active, committed)
+			}
+		})
+	}
+}
+
+func TestMeteredRequestsDoNotLeakReservationsUnderConcurrency(t *testing.T) {
+	env := newTestEnvironment(t)
+	const (
+		accountID = "acct-a"
+		requests  = 8
+	)
+	before := env.guard.accounts[accountID].Balance
+
+	recorders := make([]*httptest.ResponseRecorder, requests)
+	var wg sync.WaitGroup
+	for index := range recorders {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			request := httptest.NewRequest(http.MethodGet, "/api/v1/users", nil)
+			request.Header.Set(authorizationHeader, "Bearer "+testAdminToken)
+			request.Header.Set(accountIDHeader, accountID)
+			recorder := httptest.NewRecorder()
+			env.handler.ServeHTTP(recorder, request)
+			recorders[index] = recorder
+		}(index)
+	}
+	wg.Wait()
+
+	for _, recorder := range recorders {
+		assertStatus(t, recorder, http.StatusOK)
 	}
 
-	panicRecorder := httptest.NewRecorder()
-	panicking := env.handler.withPanicRecovery(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		panic("boom")
-	}))
-	panicking.ServeHTTP(panicRecorder, httptest.NewRequest(http.MethodGet, "/api/v1/panic", nil))
-	assertErrorCode(t, panicRecorder, "UNEXPECTED", http.StatusInternalServerError)
+	billing, quotas, _ := env.queue.snapshot()
+	if len(billing) != requests {
+		t.Fatalf("billing events = %d, want %d", len(billing), requests)
+	}
+	if len(quotas) != requests {
+		t.Fatalf("quotas = %d, want %d", len(quotas), requests)
+	}
+	seenSeq := make(map[int64]bool, requests)
+	seenBalance := make(map[int64]bool, requests)
+	for _, quota := range quotas {
+		if quota.AccountID != accountID || quota.RateLimitRPM != 120 {
+			t.Fatalf("quota = %+v", quota)
+		}
+		seenSeq[quota.Seq] = true
+		seenBalance[quota.Balance] = true
+	}
+	for index := 1; index <= requests; index++ {
+		if !seenSeq[int64(index)] {
+			t.Fatalf("seq %d missing from committed quotas: %v", index, seenSeq)
+		}
+		if !seenBalance[before-int64(index)] {
+			t.Fatalf("balance %d missing from committed quotas: %v", before-int64(index), seenBalance)
+		}
+	}
+	if got := env.guard.accounts[accountID].Balance; got != before-requests {
+		t.Fatalf("balance = %d, want %d", got, before-requests)
+	}
+	reserved, active, committed, _ := env.queue.reservationCounts()
+	if reserved != requests || active != 0 || committed != requests {
+		t.Fatalf("reservations reserved=%d active=%d committed=%d", reserved, active, committed)
+	}
 }
 
 func TestStatusForCode(t *testing.T) {
